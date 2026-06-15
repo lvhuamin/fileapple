@@ -1,0 +1,174 @@
+# RAGFlow Docker Compose 配置
+# FileApple + RAGFlow 整合项目
+
+version: '3.8'
+
+services:
+  # RAGFlow 主服务
+  ragflow:
+    image: infiniflow/ragflow:v0.25.6
+    container_name: ragflow
+    ports:
+      - "9380:9380"
+    environment:
+      # 服务配置
+      - RAGFLOW_SERVICE_IP=0.0.0.0
+      - RAGFLOW_SERVICE_PORT=9380
+      # API密钥（用于外部系统集成）
+      - RAGFLOW_API_KEY=fileapple-integration-key-2026
+      # 文档引擎
+      - DOC_ENGINE=elasticsearch
+      # LLM 默认配置
+      - LLM_BASE_URL=http://host.docker.internal:11435/v1
+      - LLM_API_KEY=EMPTY
+      - LLM_MODEL_NAME=Qwen/Qwen2.5-1.5B-Instruct
+      # Embedding 配置
+      - EMBEDDING_BASE_URL=http://host.docker.internal:11436/v1
+      - EMBEDDING_API_KEY=EMPTY
+      - EMBEDDING_MODEL_NAME=BAAI/bge-m3
+      # MySQL 配置
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=RAGFlow@123
+      - MYSQL_DATABASE=ragflow
+      # MinIO 配置
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      # Redis 配置
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # Elasticsearch 配置
+      - ES_HOST=es01
+      - ES_PORT=9200
+      - ES_USER=elastic
+      - ES_PASSWORD=RAGFlow@Elastic
+      # 解析器配置
+      - MAX_UNDERSCORE_FILE_SIZE=5368709120  # 5GB
+      - INFINITE_TIMEOUT=true
+      - RESPONSE_TIMEOUT=600
+    volumes:
+      - ./ragflow/data:/ragflow/data
+      - ./ragflow/logs:/ragflow/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      es01:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+        reservations:
+          memory: 8G
+    networks:
+      - ragflow-network
+    restart: unless-stopped
+
+  # MySQL 数据库
+  mysql:
+    image: mysql:8.4
+    container_name: ragflow-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=RAGFlow@123
+      - MYSQL_DATABASE=ragflow
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "3307:3306"
+    networks:
+      - ragflow-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pRAGFlow@123"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis 缓存
+  redis:
+    image: redis:7.2
+    container_name: ragflow-redis
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6380:6379"
+    networks:
+      - ragflow-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Elasticsearch 向量数据库
+  es01:
+    image: elasticsearch:8.11.0
+    container_name: ragflow-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=RAGFlow@Elastic
+      - "ES_JAVA_OPTS=-Xms4g -Xmx4g"
+      - xpack.security.http.ssl.enabled=false
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9210:9200"
+    networks:
+      - ragflow-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    restart: unless-stopped
+    # 生产环境建议设置
+    # ulimits:
+    #   memlock:
+    #     soft: -1
+    #     hard: -1
+
+  # MinIO 对象存储
+  minio:
+    image: minio/minio:latest
+    container_name: ragflow-minio
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    networks:
+      - ragflow-network
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+# 网络定义
+networks:
+  ragflow-network:
+    driver: bridge
+
+# 持久化卷
+volumes:
+  mysql_data:
+  redis_data:
+  es_data:
+  minio_data:

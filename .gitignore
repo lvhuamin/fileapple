@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.bak.*
+*.log
+.env
+node_modules/
+.DS_Store
+Thumbs.db
+*.db-journal
+/tmp/
+/data/

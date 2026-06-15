@@ -1,0 +1,62 @@
+# ============================================================
+# 8866 学习目录 - 知识导入流水线配置
+# ============================================================
+
+# --- 输入目录（指向 8866 上传目录） ---
+input_dir: "/root/.openclaw/workspace/learning/uploads"
+archive_dir: "/root/.openclaw/workspace/learning/uploads/.processed"
+
+# --- 优先级规则 ---
+priority:
+  weights:
+    size: 0.15
+    age: 0.10
+    type_bonus: 25
+    domain_match: 20
+  max_files_per_run: 20
+
+# --- Embedding 模型 ---
+embedding:
+  api_url: "http://192.168.0.167:11436/v1/embeddings"
+  model: "BAAI/bge-m3"
+  device: "cpu"
+  batch_size: 16
+  max_seq_length: 8192
+
+# --- 语义去重 ---
+dedup:
+  threshold: 0.92
+  cache_path: "/root/lvhuamin/fileapple/data/processed_embeddings.jsonl"
+
+# --- 文本切片 ---
+chunking:
+  max_tokens: 1000
+  overlap_tokens: 200
+
+# --- LLM 摘要 ---
+llm:
+  api_url: "http://192.168.0.167:11435/v1/chat/completions"
+  api_key: ""
+  model: "Qwen/Qwen2.5-1.5B-Instruct"
+  temperature: 0.3
+  max_tokens: 2048
+
+# --- 记忆系统地址 ---
+memory:
+  hindsight:
+    base_url: "http://localhost:8888"
+    bank_id: "shared"
+  openviking:
+    base_url: "http://localhost:1933"
+    api_key: "openviking-root-key-2026"
+
+# --- 处理记录 ---
+registry_path: "/root/lvhuamin/fileapple/data/processed_registry.jsonl"
+
+# --- 8866 下载目录（分类存放）---
+download_dir: "/root/.openclaw/workspace/learning/downloads"
+
+# --- 日志 ---
+log:
+  dir: "/root/lvhuamin/fileapple/data/logs"
+  level: "INFO"
