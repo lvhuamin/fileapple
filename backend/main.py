@@ -85,6 +85,18 @@ ALLOWED_DIRS = [UPLOADS_DIR, DOWNLOADS_DIR]
 CHUNK_SIZE = 5 * 1024 * 1024  # 5MB
 API_PORT = 8866
 
+# ========== 知识导入扩展目录（v0.2.0 多目录版）==========
+# 默认空列表：所有目录 = UPLOADS_DIR（统一目录原则）
+# 如需扩展多目录，在这里加路径或通过 /api/dirs/uploads 管理
+ADDITIONAL_UPLOAD_DIRS: List[PathLib] = []
+
+# 知识线定时扫描间隔（秒，默认 1 天）
+KNOWLEDGE_SCAN_INTERVAL = 86400
+
+# 知识线新版本（已推 GitHub v0.1.0，包含 OCR + 视频 OCR）
+KNOWLEDGE_PIPELINE_NEW = PathLib("/root/lvhuamin/knowledge-ingestion")
+KNOWLEDGE_PIPELINE_OLD = PathLib(__file__).parent / "knowledge"  # 兜底：8866 内置旧版
+
 # 确保目录存在
 for d in [UPLOADS_DIR, CHUNKS_DIR, TRANSCRIPTS_DIR, CHECKPOINTS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -1324,11 +1336,24 @@ async def remove_upload_dir(path: str = Query(...)):
 
 # ========== 知识导入流水线 ==========
 
-# 添加knowledge模块路径
-import sys
-sys.path.insert(0, str(PathLib(__file__).parent / "knowledge"))
+# 优先级：新版（/root/lvhuamin/knowledge-ingestion）→ 旧版（兜底）
+# 旧版 fileapple/backend/knowledge/ 保留作为兜底，避免新版缺失时 8866 起不来
+_KNOWLEDGE_IMPORTED_FROM = "none"
+try:
+    if KNOWLEDGE_PIPELINE_NEW.exists() and (KNOWLEDGE_PIPELINE_NEW / "ingest.py").exists():
+        sys.path.insert(0, str(KNOWLEDGE_PIPELINE_NEW))
+        from ingest import scan as ki_scan, process_file as ki_process_file
+        _KNOWLEDGE_IMPORTED_FROM = f"new:{KNOWLEDGE_PIPELINE_NEW}"
+    else:
+        raise FileNotFoundError("新版知识线不存在")
+except Exception as _e:
+    # 兜底走旧版
+    sys.path.insert(0, str(KNOWLEDGE_PIPELINE_OLD))
+    from knowledge.ingest import scan as ki_scan, process_file as ki_process_file
+    _KNOWLEDGE_IMPORTED_FROM = f"old:{KNOWLEDGE_PIPELINE_OLD}"
+    logger.warning(f"[知识线] 新版不可用 ({_e})，回退到旧版: {_KNOWLEDGE_IMPORTED_FROM}")
 
-from knowledge.ingest import scan as ki_scan, process_file as ki_process_file
+logger.info(f"[知识线] 加载来源: {_KNOWLEDGE_IMPORTED_FROM}")
 
 @app.get("/api/knowledge/scan")
 async def knowledge_scan():
@@ -1342,6 +1367,142 @@ async def knowledge_scan():
     except Exception as e:
         logger.error(f"知识扫描失败: {e}")
         return {"error": str(e), "trace": traceback.format_exc()}
+
+# ========== 知识文件分类工具（v0.2.0 多目录版）==========
+def _classify_knowledge_file(file_path: str) -> str:
+    """根据扩展名分类"""
+    ext = PathLib(file_path).suffix.lower()
+    if ext in ['.pdf', '.epub', '.docx', '.doc', '.txt', '.md']:
+        return "文档"
+    if ext in ['.mp3', '.wav', '.m4a', '.flac', '.aac']:
+        return "音频"
+    if ext in ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.webm']:
+        return "视频"
+    if ext in ['.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff', '.gif']:
+        return "图片"
+    return "其他"
+
+def _calc_file_sha256(file_path: str) -> Optional[str]:
+    """计算文件 SHA256（大文件分块读取）"""
+    try:
+        h = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception as e:
+        logger.warning(f"hash 计算失败 {file_path}: {e}")
+        return None
+
+def _collect_all_knowledge_dirs() -> List[PathLib]:
+    """收集所有启用的知识导入目录（UPLOADS_DIR + ADDITIONAL_UPLOAD_DIRS）"""
+    dirs = [UPLOADS_DIR] + [PathLib(p) for p in ADDITIONAL_UPLOAD_DIRS]
+    seen, result = set(), []
+    for d in dirs:
+        d_str = str(d.resolve())
+        if d_str not in seen:
+            seen.add(d_str)
+            result.append(d)
+    return result
+
+async def _scan_one_dir_to_db(directory: PathLib) -> Dict[str, Any]:
+    """
+    扫描单个目录，将发现的待处理文件 upsert 到 knowledge_files
+    返回该目录扫描统计
+    """
+    from database import get_db
+    db = get_db()
+    stats = {"directory": str(directory), "scanned": 0, "new_pending": 0, "already_processed": 0}
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        # 调用知识线 scan 识别待处理文件
+        try:
+            pending_files = ki_scan(str(directory))
+        except Exception as e:
+            logger.warning(f"[扫描] {directory} 调用 ki_scan 失败: {e}")
+            pending_files = []
+        stats["scanned"] = len(pending_files)
+        for f in pending_files:
+            file_path = f["path"]
+            file_name = PathLib(file_path).name
+            file_size = f.get("size", 0)
+            file_ext = PathLib(file_path).suffix.lower()
+            file_hash = _calc_file_sha256(file_path)
+            category = f.get("category") or _classify_knowledge_file(file_path)
+            rec = db.get_knowledge_file(file_path)
+            if rec and rec.get("status") == "processed" and rec.get("file_hash") == file_hash:
+                stats["already_processed"] += 1
+                continue
+            db.upsert_knowledge_file(
+                file_path=file_path, file_name=file_name, file_size=file_size,
+                file_hash=file_hash, file_ext=file_ext, category=category, status="pending",
+            )
+            stats["new_pending"] += 1
+        logger.info(f"[扫描] {directory}: scanned={stats['scanned']}, new_pending={stats['new_pending']}, already_processed={stats['already_processed']}")
+    except Exception as e:
+        logger.error(f"[扫描] {directory} 失败: {e}", exc_info=True)
+        stats["error"] = str(e)
+    return stats
+
+async def _scheduled_knowledge_scan():
+    """定时任务：扫描所有启用目录"""
+    try:
+        dirs = _collect_all_knowledge_dirs()
+        logger.info(f"[定时扫描] 开始扫描 {len(dirs)} 个目录")
+        total_stats = []
+        for d in dirs:
+            total_stats.append(await _scan_one_dir_to_db(d))
+        logger.info(f"[定时扫描] 完成: {total_stats}")
+        await manager.broadcast({
+            "type": "knowledge_scan_complete",
+            "stats": total_stats,
+        })
+    except Exception as e:
+        logger.error(f"[定时扫描] 失败: {e}", exc_info=True)
+
+# 启动时启动 APScheduler
+_scheduler: Optional["AsyncIOScheduler"] = None
+
+def _start_scheduler():
+    global _scheduler
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        _scheduler = AsyncIOScheduler()
+        _scheduler.add_job(
+            _scheduled_knowledge_scan,
+            "interval",
+            seconds=KNOWLEDGE_SCAN_INTERVAL,
+            id="knowledge_scan",
+            max_instances=1,
+            coalesce=True,
+            next_run_time=datetime.now() + timedelta(seconds=10),  # 启动 10 秒后首跑
+        )
+        _scheduler.start()
+        logger.info(f"[APScheduler] 已启动，扫描间隔 {KNOWLEDGE_SCAN_INTERVAL}s")
+    except Exception as e:
+        logger.error(f"[APScheduler] 启动失败: {e}", exc_info=True)
+
+@app.on_event("startup")
+async def _on_startup():
+    """服务启动事件：启动定时器 + 首次扫描"""
+    logger.info("[Startup] 启动知识导入扩展服务")
+    _start_scheduler()
+    # 不阻塞启动，后台跑首扫
+    asyncio.create_task(_scheduled_knowledge_scan())
+
+@app.on_event("shutdown")
+async def _on_shutdown():
+    """服务关闭事件：清理调度器"""
+    global _scheduler
+    if _scheduler:
+        try:
+            _scheduler.shutdown(wait=False)
+            logger.info("[APScheduler] 已关闭")
+        except Exception as e:
+            logger.warning(f"[APScheduler] 关闭异常: {e}")
 
 @app.post("/api/knowledge/import/batch")
 async def knowledge_import_batch(
@@ -1391,8 +1552,11 @@ async def knowledge_import(filename: str):
     return {"status": "processing", "file": filename, "path": str(filepath)}
 
 async def _do_knowledge_import(filepath: str):
-    """异步执行知识导入"""
+    """异步执行知识导入（v0.2.0：自动落库 knowledge_files）"""
     logger.info(f"[_do_knowledge_import] 开始导入: {filepath}")
+    from database import get_db
+    db = get_db()
+    db.mark_knowledge_processing(filepath)
     try:
         import yaml
         config_path = PathLib(__file__).parent / "knowledge" / "config.yaml"
@@ -1403,17 +1567,117 @@ async def _do_knowledge_import(filepath: str):
         await asyncio.to_thread(ki_process_file, filepath, cfg)
         logger.info(f"[_do_knowledge_import] 处理完成: {filepath}")
 
+        # 标记成功
+        db.mark_knowledge_processed(filepath, knowledge_id=None, source_import_id=None)
+
         await manager.broadcast({
             "type": "knowledge_import_complete",
             "file": os.path.basename(filepath)
         })
     except Exception as e:
         logger.error(f"[_do_knowledge_import] 处理失败: {filepath}, error={e}")
+        db.mark_knowledge_failed(filepath, str(e))
         await manager.broadcast({
             "type": "knowledge_import_error",
             "file": os.path.basename(filepath),
             "error": str(e)
         })
+
+# ========== v0.2.0 新 API（多目录版）==========
+@app.post("/api/knowledge/scan_all")
+async def knowledge_scan_all():
+    """手动触发扫描所有启用目录（UPLOADS_DIR + ADDITIONAL_UPLOAD_DIRS）"""
+    try:
+        dirs = _collect_all_knowledge_dirs()
+        total_stats = []
+        for d in dirs:
+            total_stats.append(await _scan_one_dir_to_db(d))
+        return {"status": "ok", "scanned_dirs": len(dirs), "stats": total_stats}
+    except Exception as e:
+        logger.error(f"[扫描] 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/knowledge/files")
+async def knowledge_list_files(
+    status: Optional[str] = Query(None, description="按状态过滤: pending/processing/processed/failed"),
+    category: Optional[str] = Query(None, description="按分类过滤: 文档/音频/视频/图片/其他"),
+    limit: int = Query(200, le=1000),
+):
+    """列出知识文件（knowledge_files 视图）"""
+    try:
+        from database import get_db
+        db = get_db()
+        rows = db.list_knowledge_files(status=status, category=category, limit=limit)
+        stats = db.get_knowledge_stats()
+        return {
+            "total_listed": len(rows),
+            "stats": stats,
+            "files": rows,
+        }
+    except Exception as e:
+        logger.error(f"[列表] 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/knowledge/import/file/{file_id}")
+async def knowledge_import_by_id(file_id: int):
+    """根据 knowledge_files.id 触发导入（用于前端"重试"按钮）"""
+    try:
+        from database import get_db
+        db = get_db()
+        # 查记录
+        all_rows = db.list_knowledge_files(limit=10000)
+        target = next((r for r in all_rows if r["id"] == file_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail=f"未找到 id={file_id}")
+        filepath = target["file_path"]
+        if not PathLib(filepath).exists():
+            raise HTTPException(status_code=404, detail=f"文件不存在: {filepath}")
+        asyncio.create_task(_do_knowledge_import(filepath))
+        return {"status": "processing", "file_id": file_id, "file": target["file_name"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[重试] file_id={file_id} 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/knowledge/dirs")
+async def knowledge_list_dirs():
+    """列出所有启用的知识导入目录（UPLOADS_DIR + ADDITIONAL_UPLOAD_DIRS）"""
+    return {
+        "primary": str(UPLOADS_DIR),
+        "additional": [str(p) for p in ADDITIONAL_UPLOAD_DIRS],
+        "all": [str(p) for p in _collect_all_knowledge_dirs()],
+        "scan_interval_seconds": KNOWLEDGE_SCAN_INTERVAL,
+    }
+
+class _DirRequest(BaseModel):
+    path: str
+
+@app.post("/api/knowledge/dirs/add")
+async def knowledge_add_dir(req: _DirRequest):
+    """添加扩展目录（运行时追加到 ADDITIONAL_UPLOAD_DIRS）"""
+    global ADDITIONAL_UPLOAD_DIRS
+    p = PathLib(req.path).resolve()
+    if not str(p).startswith(str(BASE_DIR)) and not str(p).startswith("/root/"):
+        # 安全检查：必须在 BASE_DIR 或 /root/ 下
+        logger.warning(f"[添加目录] 路径不在允许范围: {p}")
+    if str(p) in [str(x) for x in ADDITIONAL_UPLOAD_DIRS]:
+        raise HTTPException(status_code=409, detail="目录已存在")
+    if str(p) == str(UPLOADS_DIR.resolve()):
+        raise HTTPException(status_code=409, detail="不能添加主上传目录")
+    p.mkdir(parents=True, exist_ok=True)
+    ADDITIONAL_UPLOAD_DIRS.append(p)
+    logger.info(f"[添加目录] {p}, 当前扩展: {[str(x) for x in ADDITIONAL_UPLOAD_DIRS]}")
+    return {"status": "ok", "added": str(p), "total_dirs": len(_collect_all_knowledge_dirs())}
+
+@app.post("/api/knowledge/dirs/remove")
+async def knowledge_remove_dir(req: _DirRequest):
+    """移除扩展目录"""
+    global ADDITIONAL_UPLOAD_DIRS
+    p = PathLib(req.path).resolve()
+    ADDITIONAL_UPLOAD_DIRS = [x for x in ADDITIONAL_UPLOAD_DIRS if str(x.resolve()) != str(p)]
+    logger.info(f"[移除目录] {p}, 当前扩展: {[str(x) for x in ADDITIONAL_UPLOAD_DIRS]}")
+    return {"status": "ok", "removed": str(p), "total_dirs": len(_collect_all_knowledge_dirs())}
 
 @app.get("/api/knowledge/status")
 async def knowledge_status():
@@ -1840,14 +2104,15 @@ async def rag_search(
 @app.post("/api/rag/chat")
 async def rag_chat(
     question: str = Body(...),
-    dataset: str = Body(None)
+    dataset: str = Body(None),
+    history: List[Dict[str, str]] = Body(None)  # 支持传入对话历史
 ):
     """RAG 对话"""
     client = get_rag_client()
     if not client:
         raise HTTPException(status_code=503, detail="RAGFlow 未配置")
 
-    result = await client.chat_completion(question, dataset_id=dataset)
+    result = await client.chat_completion(question, dataset_id=dataset, history=history)
     return result
 
 @app.get("/api/rag/status/{dataset_id}/{doc_id}")

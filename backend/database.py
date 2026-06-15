@@ -472,11 +472,46 @@ class LearningDB:
                 )
             """)
 
+            # ============================================================
+            # 知识导入-文件级状态表（v0.2.0 多目录版）
+            # 区别于 knowledge_imports（按批次）：本表按"每个文件"记录状态
+            # 状态机：pending → processing → processed / failed
+            # 幂等键：file_hash (SHA256 of file content)
+            # ============================================================
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS knowledge_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT UNIQUE NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_size INTEGER,
+                    file_hash TEXT,
+                    file_ext TEXT,
+                    category TEXT,
+                    status TEXT DEFAULT 'pending',
+                    error_message TEXT,
+                    knowledge_id TEXT,
+                    source_import_id TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    discovered_at TEXT,
+                    processed_at TEXT,
+                    FOREIGN KEY (source_import_id) REFERENCES knowledge_imports(import_id) ON DELETE SET NULL
+                )
+            """)
+
+            # 状态机常量（避免拼写错）
+            # pending: 已发现，待处理
+            # processing: 正在转
+            # processed: 转换完成，知识已写入 Hindsight/OpenViking
+            # failed: 失败，error_message 有错
+
             # 创建索引
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_cloud_disks_active ON cloud_disks(is_active)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_sync_tasks_status ON sync_tasks(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_status ON knowledge_imports(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_tags_path ON file_tags(file_path)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_files_status ON knowledge_files(status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_files_hash ON knowledge_files(file_hash)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_files_ext ON knowledge_files(file_ext)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag)")
 
     # ========== 云盘 CRUD ==========
@@ -726,6 +761,129 @@ class LearningDB:
             cursor = conn.cursor()
             cursor.execute("SELECT file_path FROM file_tags WHERE tag = ?", (tag,))
             return [row['file_path'] for row in cursor.fetchall()]
+
+    # ========== knowledge_files CRUD（v0.2.0 多目录版）==========
+    def upsert_knowledge_file(
+        self,
+        file_path: str,
+        file_name: str,
+        file_size: int,
+        file_hash: Optional[str],
+        file_ext: str,
+        category: str = "其他",
+        status: str = "pending",
+    ) -> int:
+        """
+        插入或更新知识文件记录（按 file_path 幂等）
+        - 如果 hash 不同：更新 hash + status=pending（内容变了，重转）
+        - 如果 hash 相同 + status=processed：不重置（保持 processed）
+        """
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+            # 查现有
+            cursor.execute("SELECT id, file_hash, status FROM knowledge_files WHERE file_path = ?", (file_path,))
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute("""
+                    INSERT INTO knowledge_files
+                        (file_path, file_name, file_size, file_hash, file_ext, category, status, discovered_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (file_path, file_name, file_size, file_hash, file_ext, category, status, now))
+                return cursor.lastrowid
+            else:
+                # 现有记录
+                old_hash, old_status = row['file_hash'], row['status']
+                new_status = old_status if (old_status == "processed" and old_hash == file_hash) else status
+                cursor.execute("""
+                    UPDATE knowledge_files
+                    SET file_name=?, file_size=?, file_hash=?, file_ext=?, category=?, status=?
+                    WHERE id=?
+                """, (file_name, file_size, file_hash, file_ext, category, new_status, row['id']))
+                return row['id']
+
+    def mark_knowledge_processing(self, file_path: str) -> bool:
+        """标记为处理中（避免重复处理）"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE knowledge_files SET status='processing', retry_count=retry_count+1 WHERE file_path=?",
+                (file_path,)
+            )
+            return cursor.rowcount > 0
+
+    def mark_knowledge_processed(
+        self,
+        file_path: str,
+        knowledge_id: Optional[str] = None,
+        source_import_id: Optional[str] = None,
+    ) -> bool:
+        """标记为已处理完成"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+            cursor.execute("""
+                UPDATE knowledge_files
+                SET status='processed', knowledge_id=?, source_import_id=?, processed_at=?, error_message=NULL
+                WHERE file_path=?
+            """, (knowledge_id, source_import_id, now, file_path))
+            return cursor.rowcount > 0
+
+    def mark_knowledge_failed(self, file_path: str, error_message: str) -> bool:
+        """标记为失败"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE knowledge_files
+                SET status='failed', error_message=?
+                WHERE file_path=?
+            """, (error_message[:1000], file_path))
+            return cursor.rowcount > 0
+
+    def get_knowledge_file(self, file_path: str) -> Optional[Dict]:
+        """获取单条记录"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM knowledge_files WHERE file_path=?", (file_path,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def list_knowledge_files(
+        self,
+        status: Optional[str] = None,
+        category: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict]:
+        """列出知识文件（按状态/分类过滤）"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM knowledge_files WHERE 1=1"
+            params = []
+            if status:
+                query += " AND status=?"
+                params.append(status)
+            if category:
+                query += " AND category=?"
+                params.append(category)
+            query += " ORDER BY discovered_at DESC LIMIT ?"
+            params.append(limit)
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_knowledge_stats(self) -> Dict[str, int]:
+        """统计：pending/processing/processed/failed 数量"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT status, COUNT(*) as cnt
+                FROM knowledge_files
+                GROUP BY status
+            """)
+            stats = {"pending": 0, "processing": 0, "processed": 0, "failed": 0, "total": 0}
+            for row in cursor.fetchall():
+                stats[row['status']] = row['cnt']
+                stats['total'] += row['cnt']
+            return stats
 
     def get_storage_stats(self) -> Dict[str, Any]:
         """获取存储统计"""
