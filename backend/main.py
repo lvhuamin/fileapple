@@ -1616,22 +1616,26 @@ async def batch_delete_files(paths: List[str] = Body(...)):
 @app.post("/api/files/batch-move")
 async def batch_move_files(
     paths: List[str] = Body(...),
-    target_dir: str = Body(...)
+    target_dir: str = Body(...),
+    source: str = Body("uploads"),
+    target_source: str = Body(None)
 ):
-    """批量移动文件"""
+    """批量移动文件（支持跨源移动）"""
     import shutil
     moved = []
     failed = []
-    target_path = UPLOADS_DIR / target_dir
+    base_dir = DOWNLOADS_DIR if source == "downloads" else UPLOADS_DIR
+    dest_base = DOWNLOADS_DIR if (target_source or source) == "downloads" else UPLOADS_DIR
+    target_path = dest_base / target_dir
     target_path.mkdir(parents=True, exist_ok=True)
 
     for path in paths:
         try:
-            source = UPLOADS_DIR / path
-            dest = target_path / source.name
-            if source.exists():
-                shutil.move(str(source), str(dest))
-                moved.append({"from": path, "to": str(dest.relative_to(UPLOADS_DIR))})
+            src = base_dir / path
+            dest = target_path / src.name
+            if src.exists():
+                shutil.move(str(src), str(dest))
+                moved.append({"from": path, "to": str(dest.relative_to(dest_base))})
             else:
                 failed.append({"path": path, "error": "源文件不存在"})
         except Exception as e:
@@ -1647,12 +1651,20 @@ async def storage_stats():
     db = get_db()
     stats = db.get_storage_stats()
 
-    # 计算分类统计
+    # 计算分类统计（包含 uploads 和 downloads）
     categories = {}
-    for item in UPLOADS_DIR.iterdir():
-        if item.is_dir():
-            size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
-            categories[item.name] = {"count": len(list(item.rglob("*.*"))), "size": size}
+    for base_dir in [UPLOADS_DIR, DOWNLOADS_DIR]:
+        if not base_dir.exists():
+            continue
+        prefix = "downloads/" if base_dir == DOWNLOADS_DIR else ""
+        for item in base_dir.iterdir():
+            if item.is_dir():
+                try:
+                    size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
+                    cat_name = f"{prefix}{item.name}" if prefix else item.name
+                    categories[cat_name] = {"count": len(list(item.rglob("*.*"))), "size": size}
+                except (PermissionError, OSError):
+                    continue
 
     return {**stats, "categories": categories}
 
@@ -1664,11 +1676,18 @@ async def find_duplicates():
 
     size_name_map = defaultdict(list)
 
-    # 按大小+名称分组
-    for f in UPLOADS_DIR.rglob("*"):
-        if f.is_file():
-            key = f"{f.stat().st_size}_{f.name}"
-            size_name_map[key].append(str(f.relative_to(UPLOADS_DIR)))
+    # 按大小+名称分组（搜索 uploads 和 downloads）
+    for base_dir in [UPLOADS_DIR, DOWNLOADS_DIR]:
+        if not base_dir.exists():
+            continue
+        for f in base_dir.rglob("*"):
+            if f.is_file():
+                try:
+                    key = f"{f.stat().st_size}_{f.name}"
+                    prefix = "downloads/" if base_dir == DOWNLOADS_DIR else ""
+                    size_name_map[key].append(prefix + str(f.relative_to(base_dir)))
+                except (PermissionError, OSError):
+                    continue
 
     # 返回有重复的
     duplicates = []

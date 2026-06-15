@@ -391,8 +391,9 @@ function updateBreadcrumb(path) {
 
     parts.forEach((part, i) => {
         currentPath += '/' + part;
+        const safePath = currentPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         html += `<span class="breadcrumb-item ${i === parts.length - 1 ? 'active' : ''}"
-                       onclick="navigateTo('${currentPath}')">${part}</span>`;
+                       onclick="navigateTo('${safePath}')">${part}</span>`;
     });
 
     breadcrumb.innerHTML = html;
@@ -434,10 +435,10 @@ async function showDetail(path) {
             </div>
         </div>
         <div class="detail-actions">
-            <button class="btn btn-primary btn-block" onclick="downloadFile('${path}')">
+            <button class="btn btn-primary btn-block" onclick="downloadFile('${path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}')">
                 <i class="fas fa-download"></i> 下载
             </button>
-            <button class="btn btn-secondary btn-block" onclick="showShareModal('${path}')">
+            <button class="btn btn-secondary btn-block" onclick="showShareModal('${path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}')">
                 <i class="fas fa-share-alt"></i> 分享
             </button>
         </div>
@@ -452,7 +453,8 @@ function closeDetail() {
 // ========== 文件操作 ==========
 
 async function downloadFile(path) {
-    window.open(`${API_BASE}/api/files/download/${encodeURIComponent(path)}`, '_blank');
+    const src = state.currentSource || 'uploads';
+    window.open(`${API_BASE}/api/files/download/${encodeURIComponent(path)}?source=${src}`, '_blank');
 }
 
 async function deleteSelectedFiles() {
