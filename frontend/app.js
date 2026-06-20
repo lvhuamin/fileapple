@@ -1911,6 +1911,9 @@ async function switchView(view, category) {
         const ovContainer = document.getElementById('openvikingContainer');
         if (ovContainer) ovContainer.style.display = 'none';
         
+        // 恢复content-area的padding
+        document.querySelector('.content-area').style.padding = '';
+        
         // 显示文件相关内容
         document.querySelector('.content-area .breadcrumb').style.display = '';
         document.querySelector('.content-area .toolbar').style.display = '';
@@ -2925,6 +2928,8 @@ const OV_CONFIG = {
 };
 
 function showOpenVikingView() {
+    console.log('[OV] showOpenVikingView called');
+    
     // 隐藏其他内容
     document.querySelectorAll('.modal').forEach(m => m.classList.remove('active'));
     document.querySelector('.content-area .breadcrumb').style.display = 'none';
@@ -2933,14 +2938,28 @@ function showOpenVikingView() {
     document.getElementById('emptyState').style.display = 'none';
     document.getElementById('loadingState').style.display = 'none';
     
+    // 去掉content-area的padding让iframe充满
+    document.querySelector('.content-area').style.padding = '0';
+    
     // 显示OpenViking容器
     const ovContainer = document.getElementById('openvikingContainer');
+    if (!ovContainer) {
+        console.error('[OV] openvikingContainer not found');
+        return;
+    }
     ovContainer.style.display = 'block';
     
-    // 设置iframe src
+    // 使用当前主机名 + 1933端口
+    const ovUrl = `${window.location.protocol}//${window.location.hostname}:1933/studio/`;
+    console.log('[OV] iframe src:', ovUrl);
+    
     const iframe = document.getElementById('openvikingIframe');
-    if (iframe && !iframe.src) {
-        iframe.src = `${OV_CONFIG.baseUrl}/studio/`;
+    if (iframe) {
+        iframe.src = ovUrl;
+        iframe.onload = () => console.log('[OV] iframe loaded');
+        iframe.onerror = (e) => console.error('[OV] iframe error:', e);
+    } else {
+        console.error('[OV] iframe not found');
     }
     
     // 隐藏返回按钮
