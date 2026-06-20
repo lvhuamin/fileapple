@@ -246,6 +246,11 @@
 
                     <!-- 文件列表将动态生成 -->
                 </div>
+                
+                <!-- OpenViking Studio iframe -->
+                <div class="openviking-container" id="openvikingContainer" style="display: none;">
+                    <iframe id="openvikingIframe" src="" frameborder="0" width="100%" height="100%"></iframe>
+                </div>
             </div>
         </main>
 
@@ -750,114 +755,6 @@
                 <div class="logs-footer">
                     <span id="logsCount">共 0 条日志</span>
                     <span id="logsLastUpdate">最后更新: -</span>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- OpenViking 专区模态框 -->
-    <div class="modal" id="openvikingModal">
-        <div class="modal-content modal-large">
-            <div class="modal-header">
-                <h3><i class="fas fa-database"></i> OpenViking 记忆系统</h3>
-                <button class="icon-btn" id="btnCloseOpenViking">
-                    <i class="fas fa-times"></i>
-                </button>
-            </div>
-            <div class="modal-body">
-                <div class="openviking-tabs">
-                    <button class="tab-btn active" data-tab="ov-search">搜索记忆</button>
-                    <button class="tab-btn" data-tab="ov-write">写入记忆</button>
-                    <button class="tab-btn" data-tab="ov-browse">浏览目录</button>
-                    <button class="tab-btn" data-tab="ov-status">服务状态</button>
-                </div>
-                
-                <!-- 搜索记忆 -->
-                <div class="tab-content active" id="ov-search">
-                    <div class="ov-search-box">
-                        <input type="text" id="ovSearchInput" placeholder="输入搜索关键词..." class="input-large">
-                        <button class="btn btn-primary" id="btnOvSearch">
-                            <i class="fas fa-search"></i> 搜索
-                        </button>
-                    </div>
-                    <div class="ov-search-options">
-                        <label><input type="checkbox" id="ovSearchAuto"> 自动搜索</label>
-                        <select id="ovSearchMode">
-                            <option value="auto">自动模式</option>
-                            <option value="fast">快速搜索</option>
-                            <option value="deep">深度搜索</option>
-                        </select>
-                        <input type="number" id="ovSearchLimit" value="10" min="1" max="50" placeholder="结果数量">
-                    </div>
-                    <div id="ovSearchResults" class="ov-results">
-                        <div class="empty-state">
-                            <i class="fas fa-search"></i>
-                            <p>输入关键词开始搜索</p>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- 写入记忆 -->
-                <div class="tab-content" id="ov-write">
-                    <div class="ov-write-form">
-                        <div class="form-group">
-                            <label>内容</label>
-                            <textarea id="ovWriteContent" rows="6" placeholder="输入要保存的记忆内容..."></textarea>
-                        </div>
-                        <div class="form-group">
-                            <label>标签 (逗号分隔)</label>
-                            <input type="text" id="ovWriteTags" placeholder="例如: project, config, important">
-                        </div>
-                        <div class="form-group">
-                            <label>用户ID</label>
-                            <input type="text" id="ovWriteUserId" value="shared" placeholder="默认: shared">
-                        </div>
-                        <button class="btn btn-primary" id="btnOvWrite">
-                            <i class="fas fa-save"></i> 保存记忆
-                        </button>
-                    </div>
-                    <div id="ovWriteResult" class="ov-result-msg"></div>
-                </div>
-                
-                <!-- 浏览目录 -->
-                <div class="tab-content" id="ov-browse">
-                    <div class="ov-browse-toolbar">
-                        <input type="text" id="ovBrowseUri" value="viking://shared/memories/" placeholder="URI路径">
-                        <button class="btn btn-secondary" id="btnOvBrowse">
-                            <i class="fas fa-folder-open"></i> 浏览
-                        </button>
-                    </div>
-                    <div id="ovBrowseResults" class="ov-results">
-                        <div class="empty-state">
-                            <i class="fas fa-folder-open"></i>
-                            <p>输入URI路径浏览目录</p>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- 服务状态 -->
-                <div class="tab-content" id="ov-status">
-                    <div class="ov-status-info">
-                        <div class="status-item">
-                            <span class="status-label">服务地址:</span>
-                            <span class="status-value" id="ovStatusUrl">http://localhost:1933</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="status-label">健康状态:</span>
-                            <span class="status-value" id="ovStatusHealth">检查中...</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="status-label">版本:</span>
-                            <span class="status-value" id="ovStatusVersion">-</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="status-label">认证模式:</span>
-                            <span class="status-value" id="ovStatusAuth">-</span>
-                        </div>
-                    </div>
-                    <button class="btn btn-secondary" id="btnOvRefreshStatus">
-                        <i class="fas fa-sync"></i> 刷新状态
-                    </button>
                 </div>
             </div>
         </div>

@@ -1901,11 +1901,21 @@ async function switchView(view, category) {
     } else if (view === 'logs') {
         showLogsModal();
     } else if (view === 'openviking') {
-        showOpenVikingModal();
+        showOpenVikingView();
     } else {
         document.querySelectorAll('.modal').forEach(m => m.classList.remove('active'));
         const backBtn2 = document.getElementById('btnBack');
         if (backBtn2) backBtn2.style.display = 'none';
+        
+        // 隐藏OpenViking容器
+        const ovContainer = document.getElementById('openvikingContainer');
+        if (ovContainer) ovContainer.style.display = 'none';
+        
+        // 显示文件相关内容
+        document.querySelector('.content-area .breadcrumb').style.display = '';
+        document.querySelector('.content-area .toolbar').style.display = '';
+        document.getElementById('fileContainer').style.display = '';
+        
         await loadFiles();
     }
 }
@@ -2908,253 +2918,32 @@ function formatTime(seconds) {
 // ========== OpenViking 专区 ==========
 
 const OV_CONFIG = {
-    baseUrl: 'http://localhost:1933',
+    baseUrl: 'http://100.122.140.11:1933',
     apiKey: 'openviking-root-key-2026',
     account: 'default',
     user: 'shared'
 };
 
-function showOpenVikingModal() {
+function showOpenVikingView() {
+    // 隐藏其他内容
     document.querySelectorAll('.modal').forEach(m => m.classList.remove('active'));
-    const modal = document.getElementById('openvikingModal');
-    if (modal) {
-        modal.classList.add('active');
-        initOpenViking();
-    }
-}
-
-function initOpenViking() {
-    // 绑定关闭按钮
-    document.getElementById('btnCloseOpenViking')?.addEventListener('click', () => {
-        document.getElementById('openvikingModal')?.classList.remove('active');
-    });
+    document.querySelector('.content-area .breadcrumb').style.display = 'none';
+    document.querySelector('.content-area .toolbar').style.display = 'none';
+    document.getElementById('fileContainer').style.display = 'none';
+    document.getElementById('emptyState').style.display = 'none';
+    document.getElementById('loadingState').style.display = 'none';
     
-    // 绑定标签页切换
-    document.querySelectorAll('.openviking-tabs .tab-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('.openviking-tabs .tab-btn').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            btn.classList.add('active');
-            document.getElementById(btn.dataset.tab)?.classList.add('active');
-        });
-    });
+    // 显示OpenViking容器
+    const ovContainer = document.getElementById('openvikingContainer');
+    ovContainer.style.display = 'block';
     
-    // 绑定搜索
-    document.getElementById('btnOvSearch')?.addEventListener('click', ovSearch);
-    document.getElementById('ovSearchInput')?.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') ovSearch();
-    });
-    
-    // 绑定写入
-    document.getElementById('btnOvWrite')?.addEventListener('click', ovWrite);
-    
-    // 绑定浏览
-    document.getElementById('btnOvBrowse')?.addEventListener('click', ovBrowse);
-    
-    // 绑定状态刷新
-    document.getElementById('btnOvRefreshStatus')?.addEventListener('click', ovRefreshStatus);
-    
-    // 初始加载状态
-    ovRefreshStatus();
-}
-
-async function ovSearch() {
-    const query = document.getElementById('ovSearchInput')?.value?.trim();
-    if (!query) {
-        showToast('请输入搜索关键词', 'warning');
-        return;
+    // 设置iframe src
+    const iframe = document.getElementById('openvikingIframe');
+    if (iframe && !iframe.src) {
+        iframe.src = `${OV_CONFIG.baseUrl}/studio/`;
     }
     
-    const limit = parseInt(document.getElementById('ovSearchLimit')?.value || '10');
-    const mode = document.getElementById('ovSearchMode')?.value || 'auto';
-    const resultsEl = document.getElementById('ovSearchResults');
-    
-    resultsEl.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>搜索中...</p></div>';
-    
-    try {
-        // 使用MCP协议搜索
-        const sessionId = await ovInitMcp();
-        const result = await ovMcpCall(sessionId, 'tools/call', {
-            name: 'search',
-            arguments: { query, limit, mode }
-        });
-        
-        if (result && result.content) {
-            const items = result.content;
-            if (items.length === 0) {
-                resultsEl.innerHTML = '<div class="empty-state"><i class="fas fa-search"></i><p>未找到相关记忆</p></div>';
-                return;
-            }
-            
-            resultsEl.innerHTML = items.map(item => `
-                <div class="ov-result-item">
-                    <div class="ov-result-header">
-                        <span class="ov-result-uri">${item.uri || 'N/A'}</span>
-                        <span class="ov-result-score">${item.score ? (item.score * 100).toFixed(1) + '%' : '-'}</span>
-                    </div>
-                    <div class="ov-result-content">${escapeHtml(item.content || item.text || '')}</div>
-                    <div class="ov-result-meta">
-                        ${item.tags ? item.tags.map(t => `<span class="tag">${t}</span>`).join('') : ''}
-                    </div>
-                </div>
-            `).join('');
-        } else {
-            resultsEl.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle"></i><p>搜索返回格式异常</p></div>';
-        }
-    } catch (e) {
-        resultsEl.innerHTML = `<div class="empty-state"><i class="fas fa-exclamation-triangle"></i><p>搜索失败: ${escapeHtml(e.message)}</p></div>`;
-    }
-}
-
-async function ovWrite() {
-    const content = document.getElementById('ovWriteContent')?.value?.trim();
-    if (!content) {
-        showToast('请输入记忆内容', 'warning');
-        return;
-    }
-    
-    const tags = document.getElementById('ovWriteTags')?.value?.split(',').map(t => t.trim()).filter(Boolean) || [];
-    const userId = document.getElementById('ovWriteUserId')?.value?.trim() || 'shared';
-    const resultEl = document.getElementById('ovWriteResult');
-    
-    try {
-        const sessionId = await ovInitMcp();
-        const result = await ovMcpCall(sessionId, 'tools/call', {
-            name: 'remember',
-            arguments: { content, tags, user_id: userId }
-        });
-        
-        resultEl.innerHTML = '<div class="ov-success"><i class="fas fa-check-circle"></i> 记忆保存成功</div>';
-        document.getElementById('ovWriteContent').value = '';
-        document.getElementById('ovWriteTags').value = '';
-        showToast('记忆保存成功', 'success');
-    } catch (e) {
-        resultEl.innerHTML = `<div class="ov-error"><i class="fas fa-times-circle"></i> 保存失败: ${escapeHtml(e.message)}</div>`;
-    }
-}
-
-async function ovBrowse() {
-    const uri = document.getElementById('ovBrowseUri')?.value?.trim();
-    if (!uri) {
-        showToast('请输入URI路径', 'warning');
-        return;
-    }
-    
-    const resultsEl = document.getElementById('ovBrowseResults');
-    resultsEl.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>加载中...</p></div>';
-    
-    try {
-        const sessionId = await ovInitMcp();
-        const result = await ovMcpCall(sessionId, 'tools/call', {
-            name: 'read',
-            arguments: { uri }
-        });
-        
-        if (result && result.content) {
-            const items = Array.isArray(result.content) ? result.content : [result.content];
-            resultsEl.innerHTML = items.map(item => `
-                <div class="ov-browse-item">
-                    <div class="ov-browse-uri">${escapeHtml(item.uri || uri)}</div>
-                    <div class="ov-browse-content"><pre>${escapeHtml(typeof item === 'string' ? item : JSON.stringify(item, null, 2))}</pre></div>
-                </div>
-            `).join('');
-        } else {
-            resultsEl.innerHTML = '<div class="empty-state"><i class="fas fa-folder-open"></i><p>目录为空或不存在</p></div>';
-        }
-    } catch (e) {
-        resultsEl.innerHTML = `<div class="empty-state"><i class="fas fa-exclamation-triangle"></i><p>加载失败: ${escapeHtml(e.message)}</p></div>`;
-    }
-}
-
-async function ovRefreshStatus() {
-    const healthEl = document.getElementById('ovStatusHealth');
-    const versionEl = document.getElementById('ovStatusVersion');
-    const authEl = document.getElementById('OVConfig');
-    
-    try {
-        const resp = await fetch(`${OV_CONFIG.baseUrl}/health`, {
-            headers: { 'x-api-key': OV_CONFIG.apiKey }
-        });
-        const data = await resp.json();
-        
-        if (data.status === 'ok') {
-            healthEl.innerHTML = '<span class="status-ok"><i class="fas fa-check-circle"></i> 正常</span>';
-            versionEl.textContent = data.version || '-';
-            authEl.textContent = data.auth_mode || '-';
-        } else {
-            healthEl.innerHTML = '<span class="status-error"><i class="fas fa-times-circle"></i> 异常</span>';
-        }
-    } catch (e) {
-        healthEl.innerHTML = '<span class="status-error"><i class="fas fa-times-circle"></i> 连接失败</span>';
-        versionEl.textContent = '-';
-        authEl.textContent = '-';
-    }
-}
-
-// MCP 会话管理
-let _ovMcpSessionId = null;
-
-async function ovInitMcp() {
-    if (_ovMcpSessionId) return _ovMcpSessionId;
-    
-    const resp = await fetch(`${OV_CONFIG.baseUrl}/mcp`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json, text/event-stream',
-            'X-OpenViking-Account': OV_CONFIG.account,
-            'X-OpenViking-User': OV_CONFIG.user,
-            'x-api-key': OV_CONFIG.apiKey
-        },
-        body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'initialize',
-            params: {
-                protocolVersion: '2024-11-05',
-                capabilities: {},
-                clientInfo: { name: 'fileapple-web', version: '1.0' }
-            }
-        })
-    });
-    
-    _ovMcpSessionId = resp.headers.get('mcp-session-id');
-    if (!_ovMcpSessionId) throw new Error('无法获取MCP会话ID');
-    
-    // 读取响应体
-    await resp.text();
-    
-    return _ovMcpSessionId;
-}
-
-async function ovMcpCall(sessionId, method, params) {
-    const resp = await fetch(`${OV_CONFIG.baseUrl}/mcp`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json, text/event-stream',
-            'X-OpenViking-Account': OV_CONFIG.account,
-            'X-OpenViking-User': OV_CONFIG.user,
-            'x-api-key': OV_CONFIG.apiKey,
-            'mcp-session-id': sessionId
-        },
-        body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: Date.now(),
-            method,
-            params
-        })
-    });
-    
-    const text = await resp.text();
-    // 解析SSE格式响应
-    const lines = text.split('\n');
-    for (const line of lines) {
-        if (line.startsWith('data: ')) {
-            const data = JSON.parse(line.slice(6));
-            if (data.result) return data.result;
-            if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
-        }
-    }
-    throw new Error('无效的MCP响应');
+    // 隐藏返回按钮
+    const backBtn = document.getElementById('btnBack');
+    if (backBtn) backBtn.style.display = 'none';
 }
