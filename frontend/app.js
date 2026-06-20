@@ -2932,14 +2932,20 @@ function showOpenVikingView() {
     
     // 隐藏其他内容
     document.querySelectorAll('.modal').forEach(m => m.classList.remove('active'));
-    document.querySelector('.content-area .breadcrumb').style.display = 'none';
-    document.querySelector('.content-area .toolbar').style.display = 'none';
-    document.getElementById('fileContainer').style.display = 'none';
-    document.getElementById('emptyState').style.display = 'none';
-    document.getElementById('loadingState').style.display = 'none';
+    const bc = document.querySelector('.content-area .breadcrumb');
+    if (bc) bc.style.display = 'none';
+    const tb = document.querySelector('.content-area .toolbar');
+    if (tb) tb.style.display = 'none';
+    const fc = document.getElementById('fileContainer');
+    if (fc) fc.style.display = 'none';
+    const es = document.getElementById('emptyState');
+    if (es) es.style.display = 'none';
+    const ls = document.getElementById('loadingState');
+    if (ls) ls.style.display = 'none';
     
     // 去掉content-area的padding让iframe充满
-    document.querySelector('.content-area').style.padding = '0';
+    const ca = document.querySelector('.content-area');
+    if (ca) ca.style.padding = '0';
     
     // 显示OpenViking容器
     const ovContainer = document.getElementById('openvikingContainer');
