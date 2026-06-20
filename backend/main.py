@@ -72,7 +72,7 @@ logger.info("按日轮转日志: %s/fileapple.log", LOG_DIR)
 
 # ========== 配置 ==========
 BASE_DIR = PathLib("/root/.openclaw/workspace/learning")
-UPLOADS_DIR = BASE_DIR / "uploads"
+UPLOADS_DIR = PathLib("/root/lvhuamin/fileapple/uploads")
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 CHUNKS_DIR = BASE_DIR / "chunks"
 TRANSCRIPTS_DIR = BASE_DIR / "transcripts"
@@ -92,6 +92,7 @@ ADDITIONAL_UPLOAD_DIRS: List[PathLib] = []
 
 # 知识线定时扫描间隔（秒，默认 1 天）
 KNOWLEDGE_SCAN_INTERVAL = 86400
+EXTRACT_SCAN_INTERVAL = 4 * 3600  # 4小时自动转换
 
 # 知识线新版本（已推 GitHub v0.1.0，包含 OCR + 视频 OCR）
 KNOWLEDGE_PIPELINE_NEW = PathLib("/root/lvhuamin/knowledge-ingestion")
@@ -301,15 +302,106 @@ async def receive_client_log(request: Request):
         logger.error(f"[CLIENT:LOG] 接收日志失败: {e}")
         return {"status": "error"}
 
+@app.get("/api/client/logs")
+async def get_client_logs(limit: int = 100, level: str = None):
+    """获取前端日志"""
+    try:
+        log_file = LOG_DIR / "fileapple.log"
+        if not log_file.exists():
+            return {"logs": [], "total": 0}
+        
+        logs = []
+        with open(log_file, 'r', encoding='utf-8') as f:
+            for line in f.readlines():
+                if '[CLIENT:' in line:
+                    # 解析日志行
+                    log_entry = {
+                        'raw': line.strip(),
+                        'timestamp': line[:19] if len(line) > 19 else '',
+                        'level': 'info',
+                        'message': ''
+                    }
+                    
+                    # 提取日志级别
+                    if '[CLIENT:error]' in line:
+                        log_entry['level'] = 'error'
+                    elif '[CLIENT:warning]' in line:
+                        log_entry['level'] = 'warning'
+                    
+                    # 提取消息
+                    if '] ' in line:
+                        parts = line.split('] ', 2)
+                        if len(parts) >= 3:
+                            log_entry['message'] = parts[2].strip()
+                    
+                    # 过滤级别
+                    if level and log_entry['level'] != level:
+                        continue
+                    
+                    logs.append(log_entry)
+        
+        # 按时间倒序，返回最新的
+        logs.reverse()
+        logs = logs[:limit]
+        
+        return {"logs": logs, "total": len(logs)}
+    except Exception as e:
+        logger.error(f"[CLIENT:LOG] 读取日志失败: {e}")
+        return {"logs": [], "total": 0, "error": str(e)}
+
+@app.get("/api/client/logs/latest")
+async def get_latest_client_logs():
+    """获取最新的前端日志（实时监控用）"""
+    try:
+        log_file = LOG_DIR / "fileapple.log"
+        if not log_file.exists():
+            return {"logs": []}
+        
+        # 读取最后1000行
+        with open(log_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            last_lines = lines[-1000:] if len(lines) > 1000 else lines
+        
+        logs = []
+        for line in last_lines:
+            if '[CLIENT:' in line:
+                log_entry = {
+                    'raw': line.strip(),
+                    'timestamp': line[:19] if len(line) > 19 else '',
+                    'level': 'info',
+                    'message': ''
+                }
+                
+                if '[CLIENT:error]' in line:
+                    log_entry['level'] = 'error'
+                elif '[CLIENT:warning]' in line:
+                    log_entry['level'] = 'warning'
+                
+                if '] ' in line:
+                    parts = line.split('] ', 2)
+                    if len(parts) >= 3:
+                        log_entry['message'] = parts[2].strip()
+                
+                logs.append(log_entry)
+        
+        logs.reverse()
+        return {"logs": logs[:100]}
+    except Exception as e:
+        return {"logs": [], "error": str(e)}
+
 # --- 上传初始化 ---
 @app.post("/api/upload/init")
-async def upload_init(file_name: str = Form(...), file_size: int = Form(...)):
+async def upload_init(file_name: str = Form(...), file_size: int = Form(...), target_dir: str = Form("")):
     """初始化上传任务"""
     task_id = str(uuid.uuid4())[:16]
     total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
     
-    logger.info("[UPLOAD] 初始化: name=%s size=%s(%s) chunks=%s task_id=%s",
-                file_name, file_size, f"{file_size/1024/1024:.1f}MB", total_chunks, task_id)
+    # 校验 target_dir（安全：只允许子目录名，不含路径穿越）
+    if target_dir:
+        target_dir = target_dir.strip("/").replace("..", "")
+    
+    logger.info("[UPLOAD] 初始化: name=%s size=%s(%s) chunks=%s task_id=%s target_dir=%s",
+                file_name, file_size, f"{file_size/1024/1024:.1f}MB", total_chunks, task_id, target_dir or "(默认)")
 
     # 保存到数据库
     conn = sqlite3.connect(DB_FILE)
@@ -325,8 +417,8 @@ async def upload_init(file_name: str = Form(...), file_size: int = Form(...)):
     checkpoint = get_task_checkpoint(task_id)
     uploaded_chunks = checkpoint.get('uploaded_chunks', []) if checkpoint else []
     
-    # 保存 file_name 到断点（merge 时需要）
-    checkpoint_data = {'task_id': task_id, 'file_name': file_name, 'uploaded_chunks': uploaded_chunks}
+    # 保存 file_name 和 target_dir 到断点（merge 时需要）
+    checkpoint_data = {'task_id': task_id, 'file_name': file_name, 'uploaded_chunks': uploaded_chunks, 'target_dir': target_dir}
     save_task_checkpoint(task_id, checkpoint_data)
     
     return {
@@ -401,7 +493,23 @@ async def merge_file(task_id: str = Form(...)):
         raise HTTPException(status_code=404, detail="任务不存在")
     
     file_name = checkpoint.get('file_name', 'unknown')
-    output_path = UPLOADS_DIR / file_name
+    target_dir_name = checkpoint.get('target_dir', '')
+    if target_dir_name:
+        target_dir_path = UPLOADS_DIR / target_dir_name
+        target_dir_path.mkdir(parents=True, exist_ok=True)
+        output_path = target_dir_path / file_name
+    else:
+        output_path = UPLOADS_DIR / file_name
+    
+    # 文件名冲突处理：自动添加后缀 (1), (2), ...
+    if output_path.exists():
+        stem = output_path.stem
+        suffix = output_path.suffix
+        counter = 1
+        while output_path.exists():
+            output_path = output_path.parent / f"{stem}({counter}){suffix}"
+            counter += 1
+        logger.info("[UPLOAD] 文件名冲突，自动重命名: %s", output_path.name)
     
     # 合并（用 uploaded_chunks 列表而非 total_chunks，后者可能未保存在 checkpoint）
     uploaded_chunks = sorted(checkpoint.get('uploaded_chunks', []))
@@ -602,21 +710,8 @@ async def transcribe_upload(file: UploadFile = File(...)):
 @app.post("/api/transcribe/init")
 async def transcribe_init(source_file: str = Form(...), language: str = Form("zh"), model_size: str = Form("small")):
     """初始化转写任务"""
-    # Auto-migrate: add columns if missing (BEFORE insert)
-    try:
-        conn_m = sqlite3.connect(DB_FILE)
-        c_m = conn_m.cursor()
-        cols = [r[1] for r in c_m.execute("PRAGMA table_info(transcribe_tasks)").fetchall()]
-        if 'model_size' not in cols:
-            c_m.execute("ALTER TABLE transcribe_tasks ADD COLUMN model_size TEXT DEFAULT 'small'")
-        if 'output_srt' not in cols:
-            c_m.execute("ALTER TABLE transcribe_tasks ADD COLUMN output_srt TEXT")
-        conn_m.commit()
-        conn_m.close()
-    except:
-        pass
+      
     
-    task_id = str(uuid.uuid4())[:16]
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -649,16 +744,11 @@ async def execute_transcribe(task_id: str):
     return {"status": "processing"}
 
 async def do_transcribe(task_id: str, task: dict):
-    """执行转写 — faster-whisper (CPU int8, 支持音频+视频)"""
-    logger.info("[TRANSCRIBE] 开始转写: task_id=%s source=%s model=%s", 
-                task_id, task.get('source_file', 'unknown'), task.get('model_size', 'small'))
+    """执行转写 — 调用 31 服务器远程 Whisper API (small模型)"""
+    logger.info("[TRANSCRIBE] 开始转写: task_id=%s source=%s", 
+                task_id, task.get('source_file', 'unknown'))
     try:
-        import tempfile
-        import subprocess
-        
-        # HuggingFace 镜像（国内必需）
-        if "HF_ENDPOINT" not in os.environ:
-            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        import requests as req_lib
         
         # 更新状态
         conn = sqlite3.connect(DB_FILE)
@@ -670,69 +760,42 @@ async def do_transcribe(task_id: str, task: dict):
         await manager.broadcast({"type": "transcribe_start", "task_id": task_id})
         
         source_file = task['source_file']
-        ext = PathLib(source_file).suffix.lower()
         
-        # 视频文件需要先提取音频
-        VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv'}
-        tmp_audio = None
-        audio_path = source_file
+        # 调用 31 服务器远程转写 API
+        whisper_api = os.getenv("WHISPER_API", "http://192.168.0.31:8089")
+        logger.info("[TRANSCRIBE] 调用远程API: %s -> %s", source_file, whisper_api)
         
-        if ext in VIDEO_EXTS:
-            logger.info("[TRANSCRIBE] 检测到视频文件，提取音频轨道...")
-            tmp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            audio_path = tmp_audio.name
-            subprocess.run([
-                "ffmpeg", "-y", "-i", source_file,
-                "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                audio_path
-            ], capture_output=True, check=True)
-            logger.info("[TRANSCRIBE] 音频提取完成")
-        
-        # 加载 faster-whisper 模型
-        model_size = task.get('model_size', 'small')
-        model_start = datetime.now()
-        logger.info("[TRANSCRIBE] 加载 faster-whisper %s 模型...", model_size)
-        
-        from faster_whisper import WhisperModel
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        model_time = (datetime.now() - model_start).total_seconds()
-        logger.info("[TRANSCRIBE] 模型加载完成 (%.1fs)", model_time)
-        
-        # 转写
         transcribe_start = datetime.now()
-        language = task.get('language', 'zh')
-        if language == 'auto':
-            language = None  # faster-whisper auto-detect
+        with open(source_file, 'rb') as f:
+            files = {'file': (os.path.basename(source_file), f)}
+            resp = req_lib.post(f"{whisper_api}/transcribe", files=files, timeout=7200)
         
-        segments, info = model.transcribe(audio_path, beam_size=5, language=language)
+        if resp.status_code != 200:
+            raise Exception(f"远程API返回 {resp.status_code}: {resp.text[:200]}")
         
-        lines = []
-        srt_lines = []
-        seg_idx = 1
-        for seg in segments:
-            ts = f"[{_fmt_time(seg.start)} -> {_fmt_time(seg.end)}]"
-            lines.append(f"{ts} {seg.text.strip()}")
-            
-            # SRT 格式
-            srt_lines.append(str(seg_idx))
-            srt_lines.append(f"{_srt_time(seg.start)} --> {_srt_time(seg.end)}")
-            srt_lines.append(seg.text.strip())
-            srt_lines.append("")
-            seg_idx += 1
+        data = resp.json()
+        text = data.get("text", "")
+        language = data.get("language", "zh")
+        duration = data.get("duration", 0)
+        segments = data.get("segments", [])
         
         transcribe_time = (datetime.now() - transcribe_start).total_seconds()
-        text = "\n".join(lines)
+        logger.info("[TRANSCRIBE] 远程转写完成: %d chars, language=%s, duration=%.1fs, 耗时=%.1fs", 
+                    len(text), language, duration, transcribe_time)
+        
+        # 生成 SRT 格式
+        srt_lines = []
+        for i, seg in enumerate(segments, 1):
+            start = seg.get("start", 0)
+            end = seg.get("end", 0)
+            srt_lines.append(str(i))
+            srt_lines.append(f"{_srt_time(start)} --> {_srt_time(end)}")
+            srt_lines.append(seg.get("text", "").strip())
+            srt_lines.append("")
         srt = "\n".join(srt_lines)
         
-        logger.info("[TRANSCRIBE] 转写完成: %d segments, %d chars, language=%s, duration=%.1fs", 
-                    seg_idx-1, len(text), info.language, transcribe_time)
-        
-        # 清理临时音频
-        if tmp_audio and os.path.exists(audio_path):
-            os.unlink(audio_path)
-        
         # 保存结果
-        source_path = PathLib(task['source_file'])
+        source_path = PathLib(source_file)
         stem = source_path.stem
         
         txt_path = TRANSCRIPTS_DIR / f"{stem}.txt"
@@ -745,12 +808,11 @@ async def do_transcribe(task_id: str, task: dict):
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump({
                 "text": text,
-                "language": info.language,
-                "language_probability": info.language_probability,
-                "duration": info.duration,
-                "model_size": model_size,
-                "segments": [{"start": s.start, "end": s.end, "text": s.text.strip()} 
-                             for s in []]  # segments already consumed
+                "language": language,
+                "duration": duration,
+                "segments": segments,
+                "transcribed_at": datetime.now().isoformat(),
+                "remote_api": whisper_api,
             }, f, ensure_ascii=False, indent=2)
         
         with open(srt_path, 'w', encoding='utf-8') as f:
@@ -776,10 +838,6 @@ async def do_transcribe(task_id: str, task: dict):
         
     except Exception as e:
         logger.error("[TRANSCRIBE] 转写失败: task_id=%s error=%s", task_id, e, exc_info=True)
-        # 清理临时文件
-        if tmp_audio and os.path.exists(audio_path):
-            try: os.unlink(audio_path)
-            except: pass
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute("UPDATE transcribe_tasks SET status = 'error' WHERE task_id = ?", (task_id,))
@@ -807,6 +865,440 @@ async def transcribe_status(task_id: str):
         raise HTTPException(status_code=404, detail="任务不存在")
     
     return dict(row)
+
+
+# --- 文本提取 API ---
+EXTRACT_SUPPORTED_DOC = {".txt", ".md", ".pdf", ".docx", ".epub"}
+EXTRACT_SUPPORTED_AUDIO = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
+EXTRACT_SUPPORTED_VIDEO = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv"}
+EXTRACT_SUPPORTED_ALL = EXTRACT_SUPPORTED_DOC | EXTRACT_SUPPORTED_AUDIO | EXTRACT_SUPPORTED_VIDEO
+
+@app.post("/api/extract/upload")
+async def extract_upload(file: UploadFile = File(...), target_dir: str = Form("")):
+    """上传并提取文本内容（PDF/DOCX/EPUB/TXT/MD）
+
+    支持格式:
+    - 文本: .txt, .md, .pdf, .docx, .epub
+    - 音视频: .mp3, .wav, .flac, .aac, .ogg, .m4a, .mp4, .avi, .mov, .mkv, .flv, .wmv
+
+    参数:
+    - target_dir: 目标分类目录，如"技术运维"、"心理学"等
+
+    返回: {task_id, path, filename, size, file_type, char_count}
+    """
+    import sys
+    import time
+    
+    start_time = time.time()
+    logger.info("=" * 60)
+    logger.info("[EXTRACT] 开始上传文件")
+    logger.info("[EXTRACT] 文件名: %s", file.filename)
+    logger.info("[EXTRACT] 目标目录: %s", target_dir or "根目录")
+    logger.info("[EXTRACT] Content-Type: %s", file.content_type)
+    
+    sys.path.insert(0, str(PathLib(__file__).parent))
+    from knowledge.extractor import extract
+
+    # 创建上传目录（支持分类子目录）
+    if target_dir:
+        # 清理目录名，防止路径穿越
+        target_dir = target_dir.replace("/", "_").replace("..", "_").strip()
+        extract_dir = BASE_DIR / "uploads" / target_dir
+    else:
+        extract_dir = BASE_DIR / "uploads"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("[EXTRACT] 上传目录: %s", extract_dir)
+    
+    # 生成唯一文件名
+    ext = PathLib(file.filename).suffix.lower() if file.filename else ".tmp"
+    timestamp = int(datetime.now().timestamp())
+    hash_name = hashlib.md5(f"{file.filename}{timestamp}".encode()).hexdigest()[:12]
+    filename = f"{hash_name}{ext}"
+    filepath = extract_dir / filename
+    logger.info("[EXTRACT] 生成文件名: %s", filename)
+    logger.info("[EXTRACT] 完整路径: %s", filepath)
+    
+    # 保存文件
+    content = await file.read()
+    file_size = len(content)
+    logger.info("[EXTRACT] 文件大小: %d bytes (%.2f KB)", file_size, file_size / 1024)
+    
+    with open(filepath, 'wb') as f:
+        f.write(content)
+    logger.info("[EXTRACT] 文件保存成功")
+    
+    file_type = "unknown"
+    text = ""
+    
+    # 判断文件类型并提取
+    if ext in EXTRACT_SUPPORTED_DOC:
+        file_type = "document"
+        logger.info("[EXTRACT] 检测到文档类型: %s", ext)
+        logger.info("[EXTRACT] 开始文档提取...")
+        try:
+            text = extract(str(filepath))
+            logger.info("[EXTRACT] 文档提取完成，字符数: %d", len(text) if text else 0)
+        except Exception as e:
+            logger.error("[EXTRACT] 文档提取失败: %s", str(e))
+            logger.error("[EXTRACT] 错误详情: %s", traceback.format_exc())
+            text = ""
+    elif ext in EXTRACT_SUPPORTED_AUDIO:
+        file_type = "audio"
+        logger.info("[EXTRACT] 检测到音频类型: %s", ext)
+        logger.info("[EXTRACT] 开始音频转写...")
+        try:
+            from knowledge.transcriber import transcribe
+            text = transcribe(str(filepath)) or ""
+            logger.info("[EXTRACT] 音频转写完成，字符数: %d", len(text) if text else 0)
+            if text:
+                logger.info("[EXTRACT] 转写结果预览: %s", text[:100] + "..." if len(text) > 100 else text)
+        except Exception as e:
+            logger.error("[EXTRACT] 音频转写失败: %s", str(e))
+            logger.error("[EXTRACT] 错误详情: %s", traceback.format_exc())
+            text = ""
+    elif ext in EXTRACT_SUPPORTED_VIDEO:
+        file_type = "video"
+        logger.info("[EXTRACT] 检测到视频类型: %s", ext)
+        logger.info("[EXTRACT] 开始视频转写...")
+        try:
+            from knowledge.transcriber import transcribe
+            text = transcribe(str(filepath)) or ""
+            logger.info("[EXTRACT] 视频转写完成，字符数: %d", len(text) if text else 0)
+            if text:
+                logger.info("[EXTRACT] 转写结果预览: %s", text[:100] + "..." if len(text) > 100 else text)
+        except Exception as e:
+            logger.error("[EXTRACT] 视频转写失败: %s", str(e))
+            logger.error("[EXTRACT] 错误详情: %s", traceback.format_exc())
+            text = ""
+    else:
+        logger.warning("[EXTRACT] 不支持的文件类型: %s", ext)
+        logger.warning("[EXTRACT] 支持的类型: %s", list(EXTRACT_SUPPORTED_ALL))
+        return {"error": f"不支持的文件类型: {ext}", "supported": list(EXTRACT_SUPPORTED_ALL)}
+    
+    # 记录到数据库
+    from database import LearningDB
+    db = LearningDB(str(DB_FILE))
+    task_id = db.create_extract_task(str(filepath), filename, file_type, ext)
+    logger.info("[EXTRACT] 创建任务ID: %d", task_id)
+    
+    if task_id:
+        db.update_extract_task(task_id, status="completed", text_content=text, char_count=len(text))
+        logger.info("[EXTRACT] 任务状态更新为completed，文本长度: %d", len(text))
+    
+    elapsed_time = time.time() - start_time
+    logger.info("[EXTRACT] 处理完成，耗时: %.2f秒", elapsed_time)
+    logger.info("[EXTRACT] 结果: task_id=%d, file_type=%s, char_count=%d", task_id, file_type, len(text))
+    logger.info("=" * 60)
+    
+    return {
+        "task_id": task_id,
+        "path": str(filepath),
+        "filename": filename,
+        "size": len(content),
+        "file_type": file_type,
+        "char_count": len(text),
+        "text": text if text else ""
+    }
+
+@app.get("/api/extract/status")
+async def extract_status():
+    """获取提取状态统计"""
+    from database import LearningDB
+    db = LearningDB(str(DB_FILE))
+    stats = db.get_extract_stats()
+    stats["supported_formats"] = {
+        "document": list(EXTRACT_SUPPORTED_DOC),
+        "audio": list(EXTRACT_SUPPORTED_AUDIO),
+        "video": list(EXTRACT_SUPPORTED_VIDEO)
+    }
+    return stats
+
+@app.get("/api/extract/list")
+async def extract_list(status: str = None, limit: int = 100):
+    """获取提取任务列表"""
+    from database import LearningDB
+    db = LearningDB(str(DB_FILE))
+    return db.list_extract_tasks(status=status, limit=limit)
+
+@app.get("/api/extract/pending")
+async def extract_pending():
+    """获取待转换文件列表（从uploads目录扫描）"""
+    from database import LearningDB
+    db = LearningDB(str(DB_FILE))
+    
+    # 获取所有已提取的文件
+    extracted_files = set()
+    for task in db.list_extract_tasks(status="completed", limit=1000):
+        extracted_files.add(task["file_path"])
+    
+    # 扫描uploads目录
+    pending = []
+    for f in UPLOADS_DIR.iterdir():
+        if f.is_file():
+            ext = f.suffix.lower()
+            if ext in EXTRACT_SUPPORTED_ALL and str(f) not in extracted_files:
+                pending.append({
+                    "path": str(f),
+                    "name": f.name,
+                    "ext": ext,
+                    "size": f.stat().st_size,
+                    "modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+                })
+    
+    return {"pending": pending, "count": len(pending)}
+
+@app.post("/api/extract/process")
+async def extract_process_by_path(request: Request):
+    """通过文件路径触发转换（断点上传后调用）"""
+    data = await request.json()
+    file_path = data.get("file_path")
+    file_name = data.get("file_name", "unknown")
+    target_dir = data.get("target_dir", "")
+
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    from database import LearningDB
+    from knowledge.extractor import extract
+    db = LearningDB(str(DB_FILE))
+
+    ext = PathLib(file_path).suffix.lower()
+    file_type = "unknown"
+
+    # 判断类型
+    if ext in EXTRACT_SUPPORTED_DOC:
+        file_type = "document"
+    elif ext in EXTRACT_SUPPORTED_AUDIO:
+        file_type = "audio"
+    elif ext in EXTRACT_SUPPORTED_VIDEO:
+        file_type = "video"
+
+    # 创建任务记录
+    task_id = db.create_extract_task(file_path, file_name, file_type, ext)
+
+    if not task_id:
+        raise HTTPException(status_code=500, detail="创建任务失败")
+
+    db.update_extract_task(task_id, status="processing")
+
+    # 执行提取
+    try:
+        if ext in EXTRACT_SUPPORTED_DOC:
+            text = extract(file_path)
+        elif ext in EXTRACT_SUPPORTED_AUDIO | EXTRACT_SUPPORTED_VIDEO:
+            from knowledge.transcriber import transcribe
+            text = transcribe(file_path) or ""
+        else:
+            text = ""
+
+        db.update_extract_task(task_id, status="completed", text_content=text if text else "", char_count=len(text) if text else 0)
+        return {"task_id": task_id, "status": "completed", "char_count": len(text) if text else 0}
+
+    except Exception as e:
+        logger.error(f"[提取] 失败: {e}", exc_info=True)
+        db.update_extract_task(task_id, status="error", error_message=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/extract/process/{task_id}")
+async def extract_process(task_id: int):
+    """手动触发转换"""
+    from database import LearningDB
+    from knowledge.extractor import extract
+    db = LearningDB(str(DB_FILE))
+    
+    tasks = db.list_extract_tasks(status=None, limit=1000)
+    task = next((t for t in tasks if t.get("id") == task_id), None)
+    
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    filepath = task["file_path"]
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    
+    ext = task["file_ext"]
+    text = ""
+    
+    try:
+        db.update_extract_task(task_id, status="processing")
+        
+        if ext in EXTRACT_SUPPORTED_DOC:
+            text = extract(filepath)
+        elif ext in EXTRACT_SUPPORTED_AUDIO | EXTRACT_SUPPORTED_VIDEO:
+            from knowledge.transcriber import transcribe
+            text = transcribe(filepath) or ""
+        
+        db.update_extract_task(task_id, status="completed", text_content=text, char_count=len(text))
+        
+        return {"status": "completed", "char_count": len(text), "text": text}
+    except Exception as e:
+        db.update_extract_task(task_id, status="error", error_message=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- 文件夹批量转写 ---
+@app.post("/api/extract/folder")
+async def extract_folder(folder_path: str = Form(...)):
+    """扫描文件夹并创建批量转写任务"""
+    import asyncio
+    from database import LearningDB
+    from knowledge.transcriber import transcribe
+    
+    db = LearningDB(str(DB_FILE))
+    
+    # 检查文件夹是否存在
+    folder = PathLib(folder_path)
+    if not folder.exists() or not folder.is_dir():
+        raise HTTPException(status_code=404, detail="文件夹不存在")
+    
+    # 扫描支持的媒体文件
+    SUPPORTED_EXT = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv"}
+    media_files = sorted([
+        f for f in folder.iterdir() 
+        if f.is_file() and f.suffix.lower() in SUPPORTED_EXT
+    ], key=lambda x: x.name)
+    
+    if not media_files:
+        raise HTTPException(status_code=400, detail="文件夹中没有支持的媒体文件")
+    
+    # 创建批量任务
+    batch_id = db.create_folder_batch(str(folder), folder.name, len(media_files))
+    if not batch_id:
+        raise HTTPException(status_code=500, detail="创建批量任务失败")
+    
+    logger.info(f"[文件夹转写] 创建批量任务: batch_id={batch_id}, folder={folder.name}, files={len(media_files)}")
+    
+    # 创建各个文件的提取任务
+    task_ids = []
+    for i, f in enumerate(media_files):
+        ext = f.suffix.lower()
+        task_id = db.create_extract_task(str(f), f.name, "unknown", ext)
+        if task_id:
+            db.add_extract_to_batch(batch_id, task_id)
+            task_ids.append(task_id)
+            logger.info(f"[文件夹转写] 创建任务 {i+1}/{len(media_files)}: {f.name} -> task_id={task_id}")
+    
+    # 异步启动批量处理
+    asyncio.create_task(_process_folder_batch(batch_id))
+    
+    return {
+        "batch_id": batch_id,
+        "folder": folder.name,
+        "total_files": len(media_files),
+        "task_ids": task_ids,
+        "status": "processing"
+    }
+
+async def _process_folder_batch(batch_id: int):
+    """异步处理文件夹批量转写"""
+    import asyncio
+    from database import LearningDB
+    from knowledge.transcriber import transcribe
+    from knowledge.extractor import extract
+    
+    db = LearningDB(str(DB_FILE))
+    batch = db.get_folder_batch(batch_id)
+    if not batch:
+        logger.error(f"[文件夹转写] 批量任务不存在: {batch_id}")
+        return
+    
+    logger.info(f"[文件夹转写] 开始处理: batch_id={batch_id}, folder={batch['folder_name']}")
+    db.update_folder_batch(batch_id, status="processing")
+    
+    # 获取该批量任务下的所有提取任务
+    tasks = db.list_extract_tasks(status=None, limit=1000)
+    batch_tasks = [t for t in tasks if t.get("folder_batch_id") == batch_id]
+    
+    completed = 0
+    failed = 0
+    
+    for task in batch_tasks:
+        task_id = task["id"]
+        filepath = task["file_path"]
+        ext = task["file_ext"]
+        
+        try:
+            db.update_extract_task(task_id, status="processing")
+            logger.info(f"[文件夹转写] 处理: {task['file_name']} ({completed+1}/{len(batch_tasks)})")
+            
+            text = ""
+            if ext in EXTRACT_SUPPORTED_DOC:
+                text = await asyncio.to_thread(extract, filepath)
+            elif ext in EXTRACT_SUPPORTED_AUDIO | EXTRACT_SUPPORTED_VIDEO:
+                text = await asyncio.to_thread(transcribe, filepath) or ""
+            
+            db.update_extract_task(task_id, status="completed", text_content=text, char_count=len(text))
+            completed += 1
+            logger.info(f"[文件夹转写] 完成: {task['file_name']} -> {len(text)} 字符")
+            
+        except Exception as e:
+            failed += 1
+            db.update_extract_task(task_id, status="error", error_message=str(e))
+            logger.error(f"[文件夹转写] 失败: {task['file_name']} -> {e}")
+        
+        # 更新批量任务进度
+        db.update_folder_batch(batch_id, completed_files=completed, failed_files=failed)
+    
+    # 整合所有转写结果（按sort_order排序）
+    logger.info(f"[文件夹转写] 开始整合转写结果: batch_id={batch_id}")
+    
+    # 重新获取任务列表（包含text_content）
+    tasks = db.list_extract_tasks(status=None, limit=1000)
+    batch_tasks = [t for t in tasks if t.get("folder_batch_id") == batch_id]
+    
+    # 按sort_order排序
+    batch_tasks.sort(key=lambda x: x.get("sort_order", 0) or 0)
+    
+    # 整合文本
+    merged_parts = []
+    for task in batch_tasks:
+        if task.get("text_content"):
+            merged_parts.append(f"=== {task['file_name']} ===\n\n{task['text_content']}")
+    
+    merged_text = "\n\n" + "="*50 + "\n\n".join(merged_parts)
+    
+    # 保存整合结果
+    db.update_folder_batch(
+        batch_id, 
+        status="completed", 
+        merged_text=merged_text, 
+        merged_char_count=len(merged_text)
+    )
+    
+    # 保存为本地文件
+    merged_file = UPLOADS_DIR / f"{batch['folder_name']}_完整转写.txt"
+    with open(merged_file, 'w', encoding='utf-8') as f:
+        f.write(merged_text)
+    
+    logger.info(f"[文件夹转写] 整合完成: batch_id={batch_id}, total_chars={len(merged_text)}, file={merged_file}")
+    
+    # 广播完成事件
+    await manager.broadcast({"type": "folder_batch_complete", "batch_id": batch_id, "completed": completed, "failed": failed})
+
+@app.get("/api/extract/folder/{batch_id}")
+async def get_folder_batch_status(batch_id: int):
+    """获取文件夹批量转写状态"""
+    from database import LearningDB
+    db = LearningDB(str(DB_FILE))
+    
+    batch = db.get_folder_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="批量任务不存在")
+    
+    # 获取子任务状态
+    tasks = db.list_extract_tasks(status=None, limit=1000)
+    batch_tasks = [t for t in tasks if t.get("folder_batch_id") == batch_id]
+    
+    return {
+        "batch": batch,
+        "tasks": batch_tasks
+    }
+
+@app.get("/api/extract/folders")
+async def list_folder_batches():
+    """列出所有文件夹批量转写任务"""
+    from database import LearningDB
+    db = LearningDB(str(DB_FILE))
+    return db.list_folder_batches()
 
 # --- 列出转写任务 ---
 @app.get("/api/transcribes")
@@ -1463,6 +1955,104 @@ async def _scheduled_knowledge_scan():
     except Exception as e:
         logger.error(f"[定时扫描] 失败: {e}", exc_info=True)
 
+async def _scheduled_extract_auto():
+    """定时任务：自动转换待处理文件（4小时）"""
+    import asyncio
+    try:
+        from database import LearningDB
+        from knowledge.extractor import extract
+        
+        db = LearningDB(str(DB_FILE))
+        
+        # 获取已转换的文件路径
+        extracted_files = set()
+        for task in db.list_extract_tasks(status="completed", limit=1000):
+            extracted_files.add(task["file_path"])
+        
+        # 扫描uploads目录 - 单个文件
+        to_extract = []
+        for f in UPLOADS_DIR.iterdir():
+            if f.is_file():
+                ext = f.suffix.lower()
+                if ext in EXTRACT_SUPPORTED_ALL and str(f) not in extracted_files:
+                    to_extract.append(f)
+        
+        logger.info(f"[自动提取] 发现 {len(to_extract)} 个待处理文件")
+        
+        for f in to_extract:
+            try:
+                ext = f.suffix.lower()
+                text = ""
+                
+                # 创建任务记录
+                task_id = db.create_extract_task(str(f), f.name, "unknown", ext)
+                if not task_id:
+                    continue
+                
+                db.update_extract_task(task_id, status="processing")
+                
+                # 根据类型提取（用 asyncio.to_thread 避免阻塞事件循环）
+                if ext in EXTRACT_SUPPORTED_DOC:
+                    text = await asyncio.to_thread(extract, str(f))
+                elif ext in EXTRACT_SUPPORTED_AUDIO | EXTRACT_SUPPORTED_VIDEO:
+                    from knowledge.transcriber import transcribe
+                    text = await asyncio.to_thread(transcribe, str(f)) or ""
+                
+                db.update_extract_task(task_id, status="completed", text_content=text, 
+                                      char_count=len(text), auto_processed=True)
+                logger.info(f"[自动提取] 完成: {f.name} -> {len(text)} 字符")
+                
+            except Exception as e:
+                logger.error(f"[自动提取] 失败 {f.name}: {e}")
+                if task_id:
+                    db.update_extract_task(task_id, status="error", error_message=str(e))
+        
+        # 扫描uploads目录 - 文件夹（包含多个媒体文件）
+        SUPPORTED_MEDIA_EXT = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv"}
+        for d in UPLOADS_DIR.iterdir():
+            if d.is_dir():
+                # 检查文件夹是否已处理过
+                existing_batch = None
+                for batch in db.list_folder_batches(limit=1000):
+                    if batch["folder_path"] == str(d):
+                        existing_batch = batch
+                        break
+                
+                if existing_batch:
+                    continue
+                
+                # 扫描文件夹中的媒体文件
+                media_files = sorted([
+                    f for f in d.iterdir() 
+                    if f.is_file() and f.suffix.lower() in SUPPORTED_MEDIA_EXT
+                ], key=lambda x: x.name)
+                
+                if len(media_files) < 2:  # 至少2个文件才算教程文件夹
+                    continue
+                
+                logger.info(f"[自动提取] 发现文件夹: {d.name} ({len(media_files)} 个媒体文件)")
+                
+                # 创建批量任务
+                batch_id = db.create_folder_batch(str(d), d.name, len(media_files))
+                if not batch_id:
+                    continue
+                
+                # 创建各个文件的提取任务
+                for i, f in enumerate(media_files):
+                    ext = f.suffix.lower()
+                    task_id = db.create_extract_task(str(f), f.name, "unknown", ext)
+                    if task_id:
+                        db.add_extract_to_batch(batch_id, task_id)
+                
+                # 异步启动批量处理
+                asyncio.create_task(_process_folder_batch(batch_id))
+                logger.info(f"[自动提取] 启动文件夹批量转写: {d.name}, batch_id={batch_id}")
+        
+        await manager.broadcast({"type": "extract_auto_complete", "count": len(to_extract)})
+        
+    except Exception as e:
+        logger.error(f"[自动提取] 失败: {e}", exc_info=True)
+
 # 启动时启动 APScheduler
 _scheduler: Optional["AsyncIOScheduler"] = None
 
@@ -1478,20 +2068,29 @@ def _start_scheduler():
             id="knowledge_scan",
             max_instances=1,
             coalesce=True,
-            next_run_time=datetime.now() + timedelta(seconds=10),  # 启动 10 秒后首跑
+            # next_run_time=datetime.now() + timedelta(seconds=10),  # 启动 10 秒后首跑 - 已禁用避免阻塞
+        )
+        # 文本自动提取定时任务（4小时）
+        _scheduler.add_job(
+            _scheduled_extract_auto,
+            "interval",
+            seconds=EXTRACT_SCAN_INTERVAL,
+            id="extract_auto",
+            max_instances=1,
+            coalesce=True,
+            next_run_time=datetime.now() + timedelta(seconds=30),  # 启动 30 秒后首跑
         )
         _scheduler.start()
+        logger.info(f"[APScheduler] 知识扫描间隔 {KNOWLEDGE_SCAN_INTERVAL}s, 文本提取间隔 {EXTRACT_SCAN_INTERVAL}s")
         logger.info(f"[APScheduler] 已启动，扫描间隔 {KNOWLEDGE_SCAN_INTERVAL}s")
     except Exception as e:
         logger.error(f"[APScheduler] 启动失败: {e}", exc_info=True)
 
 @app.on_event("startup")
 async def _on_startup():
-    """服务启动事件：启动定时器 + 首次扫描"""
-    logger.info("[Startup] 启动知识导入扩展服务")
+    """服务启动事件 - 启动定时任务"""
     _start_scheduler()
-    # 不阻塞启动，后台跑首扫
-    asyncio.create_task(_scheduled_knowledge_scan())
+    logger.info("[Startup] 服务就绪，定时任务已启动")
 
 @app.on_event("shutdown")
 async def _on_shutdown():
@@ -1508,7 +2107,7 @@ async def _on_shutdown():
 async def knowledge_import_batch(
     files: List[str] = Body(...),
     category: str = Body("其他"),
-    sync_ragflow: bool = Body(True)
+    # sync_ragflow: bool = Body(True)  # RAGFlow 已禁用
 ):
     """批量导入文件到知识库"""
     import_id = str(uuid.uuid4())[:16]
@@ -1519,8 +2118,8 @@ async def knowledge_import_batch(
     db = get_db()
     db.create_knowledge_import(import_id, ",".join(files), category, len(files))
 
-    # 异步执行批量导入（包含RAGFlow同步）
-    asyncio.create_task(_do_batch_import(import_id, files, category, sync_ragflow))
+    # 异步执行批量导入（RAGFlow 同步已禁用）
+    asyncio.create_task(_do_batch_import(import_id, files, category))
 
     return {"import_id": import_id, "total": len(files), "status": "processing"}
 
@@ -1688,14 +2287,14 @@ async def knowledge_status():
     stats = db.get_knowledge_stats()
     return stats
 
-async def _do_batch_import(import_id: str, files: List[str], category: str, sync_ragflow: bool = True):
+async def _do_batch_import(import_id: str, files: List[str], category: str):  # sync_ragflow 已禁用
     """异步执行批量导入"""
     from database import get_db
     db = get_db()
 
     success = 0
     failed = 0
-    ragflow_synced = 0
+    # ragflow_synced = 0  # RAGFlow 已禁用
 
     # 转换文件路径为完整路径
     full_paths = []
@@ -1705,14 +2304,14 @@ async def _do_batch_import(import_id: str, files: List[str], category: str, sync
         else:
             full_paths.append(str(UPLOADS_DIR / f))  # 相对路径拼接
 
-    # 初始化 RAGFlow 客户端
+    # 初始化 RAGFlow 客户端 — 已禁用
     rag_client = None
-    if sync_ragflow:
-        try:
-            from ragflow_client import RAGFlowClient, RAGFlowConfig
-            rag_client = RAGFlowClient(RAGFlowConfig.from_config_file())
-        except Exception as e:
-            print(f"RAGFlow 客户端初始化失败: {e}")
+    # if sync_ragflow:
+    #     try:
+    #         from ragflow_client import RAGFlowClient, RAGFlowConfig
+    #         rag_client = RAGFlowClient(RAGFlowConfig.from_config_file())
+    #     except Exception as e:
+    #         print(f"RAGFlow 客户端初始化失败: {e}")
 
     # 分类到知识库映射
     dataset_mapping = {
@@ -1739,21 +2338,21 @@ async def _do_batch_import(import_id: str, files: List[str], category: str, sync
                     await asyncio.to_thread(ki_process_file, str(filepath), cfg)
                     success += 1
 
-                    # 同步到 RAGFlow
-                    if rag_client:
-                        try:
-                            doc_id = await rag_client.upload_document(dataset_id, str(filepath))
-                            if doc_id:
-                                await rag_client.parse_document(dataset_id, doc_id)
-                                ragflow_synced += 1
-                                await manager.broadcast({
-                                    "type": "ragflow_sync_progress",
-                                    "file": filename,
-                                    "doc_id": doc_id,
-                                    "synced": ragflow_synced
-                                })
-                        except Exception as rag_err:
-                            print(f"RAGFlow 同步失败: {filename} - {rag_err}")
+                    # 同步到 RAGFlow — 已禁用
+                    # if rag_client:
+                    #     try:
+                    #         doc_id = await rag_client.upload_document(dataset_id, str(filepath))
+                    #         if doc_id:
+                    #             await rag_client.parse_document(dataset_id, doc_id)
+                    #             ragflow_synced += 1
+                    #             await manager.broadcast({
+                    #                 "type": "ragflow_sync_progress",
+                    #                 "file": filename,
+                    #                 "doc_id": doc_id,
+                    #                 "synced": ragflow_synced
+                    #             })
+                    #     except Exception as rag_err:
+                    #         print(f"RAGFlow 同步失败: {filename} - {rag_err}")
                 else:
                     failed += 1
 
@@ -1765,8 +2364,7 @@ async def _do_batch_import(import_id: str, files: List[str], category: str, sync
                     "current": i + 1,
                     "total": len(files),
                     "success": success,
-                    "failed": failed,
-                    "ragflow_synced": ragflow_synced
+                    "failed": failed
                 })
             except Exception as e:
                 failed += 1
@@ -1778,8 +2376,7 @@ async def _do_batch_import(import_id: str, files: List[str], category: str, sync
             "type": "knowledge_batch_complete",
             "import_id": import_id,
             "success": success,
-            "failed": failed,
-            "ragflow_synced": ragflow_synced
+            "failed": failed
         })
     except Exception as e:
         db.update_knowledge_import(import_id, status='error', error=str(e))
@@ -1789,8 +2386,9 @@ async def _do_batch_import(import_id: str, files: List[str], category: str, sync
             "error": str(e)
         })
     finally:
-        if rag_client:
-            await rag_client.close()
+        pass  # RAGFlow 客户端已禁用
+        # if rag_client:
+        #     await rag_client.close()
 
 @app.get("/api/knowledge/imports")
 async def list_knowledge_imports(limit: int = Query(50)):
@@ -2014,147 +2612,147 @@ async def cancel_sync(task_id: str):
 
 # ========== 启动 ==========
 
-# ========== RAGFlow 集成 ==========
-
-# 延迟导入避免循环依赖 + 单例复用连接池
-_rag_client_instance = None
-
-def get_rag_client():
-    global _rag_client_instance
-    if _rag_client_instance is not None:
-        return _rag_client_instance
-    try:
-        from ragflow_client import RAGFlowClient, RAGFlowConfig
-        _rag_client_instance = RAGFlowClient(RAGFlowConfig.from_config_file())
-        return _rag_client_instance
-    except ImportError:
-        return None
-
-@app.get("/api/rag/health")
-async def rag_health():
-    """RAGFlow 健康检查"""
-    client = get_rag_client()
-    if not client:
-        return {"status": "unavailable", "message": "RAGFlow 未配置"}
-    healthy = await client.health_check()
-    return {"status": "healthy" if healthy else "unhealthy", "version": await client.get_version()}
-
-@app.get("/api/rag/datasets")
-async def rag_list_datasets():
-    """列出 RAGFlow 知识库"""
-    client = get_rag_client()
-    if not client:
-        raise HTTPException(status_code=503, detail="RAGFlow 未配置")
-    datasets = await client.list_datasets()
-    return {"datasets": datasets}
-
-@app.post("/api/rag/datasets")
-async def rag_create_dataset(name: str = Body(...), description: str = Body(""), language: str = Body("Chinese")):
-    """创建知识库"""
-    client = get_rag_client()
-    if not client:
-        raise HTTPException(status_code=503, detail="RAGFlow 未配置")
-    dataset_id = await client.create_dataset(name, description, language)
-    if dataset_id:
-        return {"dataset_id": dataset_id, "name": name}
-    raise HTTPException(status_code=500, detail="创建失败")
-
-@app.post("/api/rag/upload")
-async def rag_upload_file(
-    file: UploadFile = File(...),
-    dataset: str = Form("general")
-):
-    """上传文件到 RAGFlow"""
-    client = get_rag_client()
-    if not client:
-        raise HTTPException(status_code=503, detail="RAGFlow 未配置")
-
-    # 保存临时文件
-    import tempfile
-    with tempfile.NamedTemporaryFile(delete=False, suffix=PathLib(file.filename).suffix) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-
-    try:
-        # 上传到 RAGFlow
-        doc_id = await client.upload_document(dataset, tmp_path)
-        if doc_id:
-            # 触发解析
-            await client.parse_document(dataset, doc_id)
-            return {"doc_id": doc_id, "dataset": dataset, "status": "parsing"}
-        raise HTTPException(status_code=500, detail="上传失败")
-    finally:
-        PathLib(tmp_path).unlink(missing_ok=True)
-
-@app.post("/api/rag/search")
-async def rag_search(
-    query: str = Body(...),
-    dataset: str = Body("all"),
-    top_k: int = Body(10)
-):
-    """语义搜索"""
-    client = get_rag_client()
-    if not client:
-        raise HTTPException(status_code=503, detail="RAGFlow 未配置")
-
-    results = await client.search(query, top_k=top_k)
-    return {"query": query, "results": results, "count": len(results)}
-
-@app.post("/api/rag/chat")
-async def rag_chat(
-    question: str = Body(...),
-    dataset: str = Body(None),
-    history: List[Dict[str, str]] = Body(None)  # 支持传入对话历史
-):
-    """RAG 对话"""
-    client = get_rag_client()
-    if not client:
-        raise HTTPException(status_code=503, detail="RAGFlow 未配置")
-
-    result = await client.chat_completion(question, dataset_id=dataset, history=history)
-    return result
-
-@app.get("/api/rag/status/{dataset_id}/{doc_id}")
-async def rag_document_status(dataset_id: str, doc_id: str):
-    """获取文档解析状态"""
-    client = get_rag_client()
-    if not client:
-        raise HTTPException(status_code=503, detail="RAGFlow 未配置")
-
-    status = await client.get_document_status(dataset_id, doc_id)
-    return status
-
-@app.post("/api/rag/import/{category}")
-async def rag_import_category(
-    category: str,
-    files: List[str] = Body(...)
-):
-    """批量导入文件到指定分类知识库"""
-    client = get_rag_client()
-    if not client:
-        raise HTTPException(status_code=503, detail="RAGFlow 未配置")
-
-    # 映射分类到知识库
-    dataset_mapping = {
-        "技术运维": "tech-ops",
-        "心理学": "psychology",
-        "恋爱心理": "relationship",
-        "文档": "documents",
-        "有声剧": "audio-books",
-        "其他": "general"
-    }
-    dataset_id = dataset_mapping.get(category, "general")
-
-    results = []
-    for file_path in files:
-        try:
-            result = await client.import_file(file_path, dataset_id, wait_completed=False)
-            results.append({"file": file_path, "result": result})
-        except Exception as e:
-            results.append({"file": file_path, "error": str(e)})
-
-    return {"category": category, "dataset": dataset_id, "results": results}
+# ========== RAGFlow 集成 (已禁用，保留代码供未来恢复) ==========
+#
+# # 延迟导入避免循环依赖 + 单例复用连接池
+# _rag_client_instance = None
+#
+# def get_rag_client():
+#     global _rag_client_instance
+#     if _rag_client_instance is not None:
+#         return _rag_client_instance
+#     try:
+#         from ragflow_client import RAGFlowClient, RAGFlowConfig
+#         _rag_client_instance = RAGFlowClient(RAGFlowConfig.from_config_file())
+#         return _rag_client_instance
+#     except ImportError:
+#         return None
+#
+# @app.get("/api/rag/health")
+# async def rag_health():
+#     """RAGFlow 健康检查"""
+#     client = get_rag_client()
+#     if not client:
+#         return {"status": "unavailable", "message": "RAGFlow 未配置"}
+#     healthy = await client.health_check()
+#     return {"status": "healthy" if healthy else "unhealthy", "version": await client.get_version()}
+#
+# @app.get("/api/rag/datasets")
+# async def rag_list_datasets():
+#     """列出 RAGFlow 知识库"""
+#     client = get_rag_client()
+#     if not client:
+#         raise HTTPException(status_code=503, detail="RAGFlow 未配置")
+#     datasets = await client.list_datasets()
+#     return {"datasets": datasets}
+#
+# @app.post("/api/rag/datasets")
+# async def rag_create_dataset(name: str = Body(...), description: str = Body(""), language: str = Body("Chinese")):
+#     """创建知识库"""
+#     client = get_rag_client()
+#     if not client:
+#         raise HTTPException(status_code=503, detail="RAGFlow 未配置")
+#     dataset_id = await client.create_dataset(name, description, language)
+#     if dataset_id:
+#         return {"dataset_id": dataset_id, "name": name}
+#     raise HTTPException(status_code=500, detail="创建失败")
+#
+# @app.post("/api/rag/upload")
+# async def rag_upload_file(
+#     file: UploadFile = File(...),
+#     dataset: str = Form("general")
+# ):
+#     """上传文件到 RAGFlow"""
+#     client = get_rag_client()
+#     if not client:
+#         raise HTTPException(status_code=503, detail="RAGFlow 未配置")
+#
+#     # 保存临时文件
+#     import tempfile
+#     with tempfile.NamedTemporaryFile(delete=False, suffix=PathLib(file.filename).suffix) as tmp:
+#         content = await file.read()
+#         tmp.write(content)
+#         tmp_path = tmp.name
+#
+#     try:
+#         # 上传到 RAGFlow
+#         doc_id = await client.upload_document(dataset, tmp_path)
+#         if doc_id:
+#             # 触发解析
+#             await client.parse_document(dataset, doc_id)
+#             return {"doc_id": doc_id, "dataset": dataset, "status": "parsing"}
+#         raise HTTPException(status_code=500, detail="上传失败")
+#     finally:
+#         PathLib(tmp_path).unlink(missing_ok=True)
+#
+# @app.post("/api/rag/search")
+# async def rag_search(
+#     query: str = Body(...),
+#     dataset: str = Body("all"),
+#     top_k: int = Body(10)
+# ):
+#     """语义搜索"""
+#     client = get_rag_client()
+#     if not client:
+#         raise HTTPException(status_code=503, detail="RAGFlow 未配置")
+#
+#     results = await client.search(query, top_k=top_k)
+#     return {"query": query, "results": results, "count": len(results)}
+#
+# @app.post("/api/rag/chat")
+# async def rag_chat(
+#     question: str = Body(...),
+#     dataset: str = Body(None),
+#     history: List[Dict[str, str]] = Body(None)  # 支持传入对话历史
+# ):
+#     """RAG 对话"""
+#     client = get_rag_client()
+#     if not client:
+#         raise HTTPException(status_code=503, detail="RAGFlow 未配置")
+#
+#     result = await client.chat_completion(question, dataset_id=dataset, history=history)
+#     return result
+#
+# @app.get("/api/rag/status/{dataset_id}/{doc_id}")
+# async def rag_document_status(dataset_id: str, doc_id: str):
+#     """获取文档解析状态"""
+#     client = get_rag_client()
+#     if not client:
+#         raise HTTPException(status_code=503, detail="RAGFlow 未配置")
+#
+#     status = await client.get_document_status(dataset_id, doc_id)
+#     return status
+#
+# @app.post("/api/rag/import/{category}")
+# async def rag_import_category(
+#     category: str,
+#     files: List[str] = Body(...)
+# ):
+#     """批量导入文件到指定分类知识库"""
+#     client = get_rag_client()
+#     if not client:
+#         raise HTTPException(status_code=503, detail="RAGFlow 未配置")
+#
+#     # 映射分类到知识库
+#     dataset_mapping = {
+#         "技术运维": "tech-ops",
+#         "心理学": "psychology",
+#         "恋爱心理": "relationship",
+#         "文档": "documents",
+#         "有声剧": "audio-books",
+#         "其他": "general"
+#     }
+#     dataset_id = dataset_mapping.get(category, "general")
+#
+#     results = []
+#     for file_path in files:
+#         try:
+#             result = await client.import_file(file_path, dataset_id, wait_completed=False)
+#             results.append({"file": file_path, "result": result})
+#         except Exception as e:
+#             results.append({"file": file_path, "error": str(e)})
+#
+#     return {"category": category, "dataset": dataset_id, "results": results}
 
 
 # ========== 启动 ==========
@@ -2193,7 +2791,6 @@ if __name__ == "__main__":
 ╔══════════════════════════════════════════════════╗
 ║  学习目录 API 服务                               ║
 ║  分片上传 + 断点续传 + 音频转文字 + 知识导入       ║
-║  RAGFlow 集成 + 语义搜索                          ║
 ╠══════════════════════════════════════════════════╣
 ║  Web UI:   http://localhost:{API_PORT}            ║
 ║  HTTP API: http://localhost:{API_PORT}/api        ║
@@ -2203,11 +2800,6 @@ if __name__ == "__main__":
 ║  知识导入:                                      ║
 ║    GET  /api/knowledge/scan     # 扫描待导入文件  ║
 ║    POST /api/knowledge/import/  # 触发导入       ║
-║  RAG 搜索:                                      ║
-║    GET  /api/rag/health         # 健康检查       ║
-║    GET  /api/rag/datasets      # 知识库列表      ║
-║    POST /api/rag/search        # 语义搜索        ║
-║    POST /api/rag/chat          # RAG 对话        ║
 ╚══════════════════════════════════════════════════╝
     """)
     uvicorn.run(app, host="0.0.0.0", port=API_PORT, log_level="info")

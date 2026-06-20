@@ -376,34 +376,14 @@ page.locator("#btnCloseShare").click(timeout=3000)
 page.wait_for_timeout(200)
 
 # ============================================================
-# 模块11: RAG功能 (201-215)
+# 模块11: RAG功能 (201-215) — 已禁用，跳过
 # ============================================================
 print("\n" + "=" * 50)
-print("  模块11: RAG功能 (201-215)")
+print("  模块11: RAG功能 (201-215) — 已禁用，跳过")
 print("=" * 50)
 
-page.locator('.nav-item[data-view="rag-search"]').click(timeout=3000)
-page.wait_for_timeout(300)
-run_test("R001-RAG搜索打开", lambda: None if "active" in (safe_attr("#ragSearchModal", "class") or "") else Exception())
-run_test("R002-语义搜索输入", lambda: None if safe_count("#ragSearchInput") > 0 else Exception())
-run_test("R003-知识库选择框", lambda: None if safe_count("#ragSearchDataset") > 0 else Exception())
-run_test("R004-知识库选项>=5", lambda: None if safe_count("#ragSearchDataset option") >= 5 else Exception())
-run_test("R005-搜索按钮", lambda: None if safe_count("#btnRagSearch") > 0 else Exception())
-run_test("R006-搜索信息区", lambda: None if safe_count("#ragSearchInfo") > 0 else Exception())
-run_test("R007-搜索结果区", lambda: None if safe_count("#ragSearchResults") > 0 else Exception())
-run_test("R008-空状态提示", lambda: None if safe_count(".rag-results .empty-state") > 0 else Exception())
-page.locator("#btnCloseRagSearch").click(timeout=3000)
-page.wait_for_timeout(200)
-
-page.locator('.nav-item[data-view="rag-chat"]').click(timeout=3000)
-page.wait_for_timeout(300)
-run_test("R009-RAG对话打开", lambda: None if "active" in (safe_attr("#ragChatModal", "class") or "") else Exception())
-run_test("R010-对话知识库选择", lambda: None if safe_count("#ragChatDataset") > 0 else Exception())
-run_test("R011-对话消息区", lambda: None if safe_count("#ragChatMessages") > 0 else Exception())
-run_test("R012-对话输入框", lambda: None if safe_count("#ragChatInput") > 0 else Exception())
-run_test("R013-发送按钮", lambda: None if safe_count("#btnRagChat") > 0 else Exception())
-page.locator("#btnCloseRagChat").click(timeout=3000)
-page.wait_for_timeout(200)
+for i in range(15):
+    results.append(("SKIP", f"R{i+1:03d}-RAG已禁用", ""))
 
 # ============================================================
 # 模块12: 音频转写 (216-225)

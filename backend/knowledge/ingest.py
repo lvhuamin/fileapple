@@ -26,8 +26,6 @@ from chunker import chunk
 from embedder import get_embedder, get_dedup_cache
 from summarizer import summarize
 from openviking_writer import write_knowledge_unit
-from hindsight_writer import write_knowledge_to_hindsight
-from sync_to_8866 import sync_result
 
 # 路径
 BASE_DIR = Path(__file__).parent.parent.parent.parent
@@ -149,12 +147,6 @@ def process_file(filepath, cfg):
 
     if not text or len(text.strip()) < 20:
         logger.warning("无法提取有效文本: %s", fname)
-        write_knowledge_to_hindsight(
-            filename=fname, file_type=file_type,
-            knowledge={"summary": "", "knowledge_points": []},
-            chunks=[], status="skip", error="no usable text",
-            **cfg["memory"]["hindsight"],
-        )
         return False
 
     # Step 2: 切片
@@ -178,7 +170,6 @@ def process_file(filepath, cfg):
     dedup_cache = get_dedup_cache(cache_path=dedup_cfg.get("cache_path", str(DATA_DIR / "processed_embeddings.jsonl")))
     if embedding_vec and dedup_cache.is_duplicate(embedding_vec, threshold=dedup_cfg.get("threshold", 0.92)):
         logger.info("去重跳过: %s", fname)
-        write_knowledge_to_hindsight(filename=fname, file_type=file_type, knowledge=knowledge, chunks=chunks, status="dedup_skip", **cfg["memory"]["hindsight"])
         return True
 
     # Step 6: 写入 OpenViking
@@ -188,15 +179,7 @@ def process_file(filepath, cfg):
     if ov_ok and embedding_vec:
         dedup_cache.add(fname, summary_text, embedding_vec)
 
-    # Step 7: 写入 Hindsight
-    hi_cfg = cfg["memory"]["hindsight"]
-    hindsight_ok = write_knowledge_to_hindsight(filename=fname, file_type=file_type, knowledge=knowledge, chunks=chunks, status="ok" if ov_ok else "write_failed", **hi_cfg)
-
-    # Step 8: 同步到 8866 下载目录
-    sync_base_dir = cfg.get("download_dir", "/root/.openclaw/workspace/learning/downloads")
-    sync_result(filename=fname, file_type=file_type, knowledge=knowledge, chunks=chunks, base_dir=sync_base_dir, domains=knowledge.get("domains", []))
-
-    # Step 9: 写入 registry + 归档
+    # Step 7: 写入 registry + 归档
     if ov_ok:
         entry = {
             "filename": fname, "filepath": filepath, "status": "ok",
@@ -209,7 +192,7 @@ def process_file(filepath, cfg):
         if _archive_file(filepath, archive_dir):
             logger.info("已归档: %s", fname)
 
-    logger.info("完成: %s → OV=%s HI=%s", fname, "OK" if ov_ok else "FAIL", "OK" if hindsight_ok else "FAIL")
+    logger.info("完成: %s → OV=%s", fname, "OK" if ov_ok else "FAIL")
     return ov_ok
 
 # 批量处理

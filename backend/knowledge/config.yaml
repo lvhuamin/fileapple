@@ -43,18 +43,12 @@ llm:
 
 # --- 记忆系统地址 ---
 memory:
-  hindsight:
-    base_url: "http://localhost:8888"
-    bank_id: "shared"
   openviking:
     base_url: "http://localhost:1933"
     api_key: "openviking-root-key-2026"
 
 # --- 处理记录 ---
 registry_path: "/root/lvhuamin/fileapple/data/processed_registry.jsonl"
-
-# --- 8866 下载目录（分类存放）---
-download_dir: "/root/.openclaw/workspace/learning/downloads"
 
 # --- 日志 ---
 log:

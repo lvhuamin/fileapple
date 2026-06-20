@@ -1,10 +1,10 @@
 """
-音频/视频转录 — faster-whisper
-输出带时间戳的纯文本
+音频/视频转录 — 支持远程API调用
 """
 import os
 import logging
 import tempfile
+import requests
 from pathlib import Path
 
 logger = logging.getLogger("ingestion.transcriber")
@@ -13,32 +13,65 @@ SUPPORTED_VIDEO = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv"}
 SUPPORTED_AUDIO = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 SUPPORTED = SUPPORTED_VIDEO | SUPPORTED_AUDIO
 
+# 远程转写API地址（31服务器）
+REMOTE_API = os.getenv("WHISPER_API", "http://192.168.0.31:8089")
+
 
 def is_supported(filepath: str) -> bool:
     ext = os.path.splitext(filepath)[1].lower()
     return ext in SUPPORTED
 
 
-def transcribe(filepath: str, model_size: str = "small") -> str | None:
+def transcribe(filepath: str, model_size: str = "tiny") -> str | None:
     """
     转录视频/音频文件为文本。
-    model_size: tiny / base / small / medium / large-v3
-    默认 small（平衡速度与质量，~1GB 内存）
-    首次运行会自动下载模型到 ~/.cache/huggingface/hub/
+    优先使用远程API（192.168.0.31），失败则用本地faster-whisper
     """
-    # HuggingFace 镜像（国内必需）
-    if "HF_ENDPOINT" not in os.environ:
-        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
     ext = os.path.splitext(filepath)[1].lower()
     if ext not in SUPPORTED:
         logger.warning("unsupported media format: %s", ext)
         return None
 
+    # 优先调用远程API
+    try:
+        return _transcribe_remote(filepath)
+    except Exception as e:
+        logger.warning(f"远程转写失败，尝试本地: {e}")
+        return _transcribe_local(filepath)
+
+
+def _transcribe_remote(filepath: str) -> str | None:
+    """调用31服务器的远程API转写"""
+    try:
+        logger.info(f"[远程转写] {filepath} -> {REMOTE_API}")
+        with open(filepath, 'rb') as f:
+            files = {'file': (os.path.basename(filepath), f)}
+            resp = requests.post(
+                f"{REMOTE_API}/transcribe",
+                files=files,
+                timeout=3600  # 1小时超时
+            )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            logger.info(f"[远程转写] 完成: {data.get('char_count', 0)} 字符")
+            return data.get("text", "")
+        else:
+            raise Exception(f"API返回 {resp.status_code}")
+
+    except Exception as e:
+        raise Exception(f"远程转写失败: {e}")
+
+
+def _transcribe_local(filepath: str) -> str | None:
+    """本地faster-whisper转写（备用）"""
+    if "HF_ENDPOINT" not in os.environ:
+        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+    ext = os.path.splitext(filepath)[1].lower()
     try:
         from faster_whisper import WhisperModel
 
-        # 提取音频轨道（视频需要）
         audio_path = filepath
         tmp_audio = None
         if ext in SUPPORTED_VIDEO:
@@ -46,9 +79,8 @@ def transcribe(filepath: str, model_size: str = "small") -> str | None:
             audio_path = tmp_audio.name
             _extract_audio(filepath, audio_path)
 
-        # 转录（99 无 GPU，用 CPU int8）
-        logger.info("transcribing %s with faster-whisper %s ...", os.path.basename(filepath), model_size)
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        logger.info("transcribing %s with faster-whisper local ...", os.path.basename(filepath))
+        model = WhisperModel("tiny", device="cpu", compute_type="int8")
         segments, info = model.transcribe(audio_path, beam_size=5, language="zh")
 
         lines = []
@@ -57,16 +89,15 @@ def transcribe(filepath: str, model_size: str = "small") -> str | None:
             lines.append(f"{ts} {seg.text.strip()}")
 
         text = "\n".join(lines)
-        logger.info("transcribed: %s → %d chars, language=%s", os.path.basename(filepath), len(text), info.language)
+        logger.info("transcribed local: %s → %d chars", os.path.basename(filepath), len(text))
 
-        # 清理临时音频文件
         if tmp_audio:
             os.unlink(audio_path)
 
         return text
 
     except Exception as e:
-        logger.error("transcribe failed [%s]: %s", filepath, e)
+        logger.error("local transcribe failed [%s]: %s", filepath, e)
         if tmp_audio and os.path.exists(audio_path):
             os.unlink(audio_path)
         return None

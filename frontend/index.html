@@ -42,6 +42,24 @@
                         <i class="fas fa-download"></i>
                         <span>下载目录</span>
                     </a>
+                    <a href="#" class="nav-item" data-view="cloud">
+                        <i class="fas fa-cloud"></i>
+                        <span>云盘管理</span>
+                        <span class="nav-badge nav-badge-new">NEW</span>
+                    </a>
+                    <a href="#" class="nav-item" data-view="extract">
+                        <i class="fas fa-file-alt"></i>
+                        <span>文本提取</span>
+                        <span class="nav-badge nav-badge-new">NEW</span>
+                    </a>
+                </div>
+
+                <div class="nav-section">
+                    <div class="nav-section-title">上传</div>
+                    <a href="#" class="nav-item" data-view="upload">
+                        <i class="fas fa-upload"></i>
+                        <span>上传文件</span>
+                    </a>
                 </div>
 
                 <div class="nav-section">
@@ -57,6 +75,11 @@
                     <a href="#" class="nav-item" data-view="category" data-category="恋爱心理">
                         <i class="fas fa-heart"></i>
                         <span>恋爱心理</span>
+                    </a>
+                    <a href="#" class="nav-item love-zone" data-view="love-zone">
+                        <i class="fas fa-heart" style="color: #ff4757;"></i>
+                        <span>恋爱专区</span>
+                        <span class="nav-badge nav-badge-new" style="background: #ff4757;">NEW</span>
                     </a>
                     <a href="#" class="nav-item" data-view="category" data-category="文档">
                         <i class="fas fa-file-alt"></i>
@@ -83,14 +106,13 @@
                         <span>知识导入</span>
                         <span class="nav-badge nav-badge-new">NEW</span>
                     </a>
-                    <a href="#" class="nav-item" data-view="cloud">
-                        <i class="fas fa-cloud"></i>
-                        <span>云盘管理</span>
-                        <span class="nav-badge nav-badge-new">NEW</span>
+                    <a href="#" class="nav-item" data-view="logs">
+                        <i class="fas fa-list-alt"></i>
+                        <span>系统日志</span>
                     </a>
                 </div>
 
-                <div class="nav-section">
+                <div class="nav-section" style="display:none">
                     <div class="nav-section-title">AI 能力</div>
                     <a href="#" class="nav-item" data-view="rag-search">
                         <i class="fas fa-brain"></i>
@@ -152,9 +174,10 @@
                             <i class="fas fa-list"></i>
                         </button>
                     </div>
-                    <button class="btn btn-primary" id="btnUpload">
+                    <button class="btn btn-primary" id="btnUpload" style="position: relative;">
                         <i class="fas fa-plus"></i>
                         上传
+                        <span class="queue-badge" id="uploadQueueBadge" style="display: none;"></span>
                     </button>
                     <button class="btn btn-secondary" id="btnNewFolder">
                         <i class="fas fa-folder-plus"></i>
@@ -446,8 +469,8 @@
         </div>
     </div>
 
-    <!-- RAG 搜索模态框 -->
-    <div class="modal" id="ragSearchModal">
+    <!-- RAG 搜索模态框 (已禁用) -->
+    <div class="modal" id="ragSearchModal" style="display:none">
         <div class="modal-content modal-large">
             <div class="modal-header">
                 <h3><i class="fas fa-brain"></i> 语义搜索</h3>
@@ -482,8 +505,8 @@
         </div>
     </div>
 
-    <!-- RAG 对话模态框 -->
-    <div class="modal" id="ragChatModal">
+    <!-- RAG 对话模态框 (已禁用) -->
+    <div class="modal" id="ragChatModal" style="display:none">
         <div class="modal-content modal-large">
             <div class="modal-header">
                 <h3><i class="fas fa-comments"></i> RAG 对话</h3>
@@ -581,6 +604,152 @@
         </div>
     </div>
 
+    <!-- 文本提取模态框 -->
+    <div class="modal" id="extractModal">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3><i class="fas fa-file-alt"></i> 文本提取</h3>
+                <button class="icon-btn" id="btnCloseExtract">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="extract-stats" id="extractStats">
+                    <div class="stat-card">
+                        <span class="stat-num" id="extractTotal">0</span>
+                        <span class="stat-label">总计</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-num" id="extractCompleted">0</span>
+                        <span class="stat-label">已完成</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-num" id="extractPending">0</span>
+                        <span class="stat-label">待处理</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-num" id="extractError">0</span>
+                        <span class="stat-label">失败</span>
+                    </div>
+                </div>
+                
+                <div class="extract-upload">
+                    <div class="upload-row">
+                        <select id="extractTargetDir" class="folder-select">
+                            <option value="">上传到根目录</option>
+                            <option value="技术运维">📁 技术运维</option>
+                            <option value="心理学">📁 心理学</option>
+                            <option value="恋爱心理">📁 恋爱心理</option>
+                            <option value="文档">📁 文档资料</option>
+                            <option value="有声剧">📁 有声剧</option>
+                        </select>
+                        <button class="btn btn-primary" id="btnSelectExtract">
+                            <i class="fas fa-upload"></i> 选择文件
+                        </button>
+                        <button class="btn btn-secondary" id="btnSelectFolder">
+                            <i class="fas fa-folder-open"></i> 选择文件夹
+                        </button>
+                    </div>
+                    <div class="upload-dropzone" id="extractDropzone">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                        <p>拖拽文件或文件夹到此处上传</p>
+                        <p class="upload-hint">支持: PDF, DOCX, TXT, MD, EPUB | MP3, WAV, M4A, OGG | MP4, AVI, MOV, MKV</p>
+                    </div>
+                    <div class="upload-progress" id="uploadProgress" style="display: none;">
+                        <div class="progress-info">
+                            <span id="uploadFileName">文件名</span>
+                            <span id="uploadStatus">上传中...</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="uploadFill" style="width: 0%"></div>
+                        </div>
+                        <div class="progress-details">
+                            <span id="uploadPercent">0%</span>
+                            <span id="uploadSpeed">-</span>
+                            <span id="uploadTimeLeft">-</span>
+                        </div>
+                    </div>
+                    <input type="file" id="extractInput" accept=".pdf,.docx,.txt,.md,.epub,.mp3,.wav,.m4a,.ogg,.flac,.aac,.mp4,.avi,.mov,.mkv,.flv,.wmv" hidden multiple>
+                    <input type="file" id="folderInput" webkitdirectory hidden multiple>
+                </div>
+
+                <div class="extract-formats">
+                    <h4>支持格式</h4>
+                    <div class="format-tags">
+                        <span class="format-tag">PDF</span>
+                        <span class="format-tag">DOCX</span>
+                        <span class="format-tag">TXT</span>
+                        <span class="format-tag">MD</span>
+                        <span class="format-tag">EPUB</span>
+                        <span class="format-tag">MP3</span>
+                        <span class="format-tag">WAV</span>
+                        <span class="format-tag">M4A</span>
+                        <span class="format-tag">MP4</span>
+                        <span class="format-tag">AVI</span>
+                        <span class="format-tag">MOV</span>
+                        <span class="format-tag">MKV</span>
+                    </div>
+                </div>
+
+                <div class="extract-pending" id="extractPending">
+                    <h4>待处理文件 <span id="pendingCount">(0)</span></h4>
+                    <div id="extractPendingList" class="file-list"></div>
+                </div>
+
+                <div class="extract-history" id="extractHistory">
+                    <h4>已处理 <span id="historyCount">(0)</span></h4>
+                    <div id="extractHistoryList" class="file-list"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 系统日志模态框 -->
+    <div class="modal" id="logsModal">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3><i class="fas fa-list-alt"></i> 系统日志</h3>
+                <button class="icon-btn" id="btnCloseLogs">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="logs-toolbar">
+                    <div class="logs-filter">
+                        <select id="logsLevelFilter">
+                            <option value="">全部级别</option>
+                            <option value="error">错误</option>
+                            <option value="warning">警告</option>
+                            <option value="info">信息</option>
+                        </select>
+                        <input type="number" id="logsLimit" value="100" min="10" max="1000" placeholder="显示条数">
+                    </div>
+                    <div class="logs-actions">
+                        <button class="btn btn-secondary" id="btnRefreshLogs">
+                            <i class="fas fa-sync"></i> 刷新
+                        </button>
+                        <button class="btn btn-secondary" id="btnAutoRefresh">
+                            <i class="fas fa-play"></i> 自动刷新
+                        </button>
+                        <button class="btn btn-secondary" id="btnClearLogs">
+                            <i class="fas fa-trash"></i> 清空显示
+                        </button>
+                    </div>
+                </div>
+                <div class="logs-container" id="logsContainer">
+                    <div class="empty-state">
+                        <i class="fas fa-list-alt"></i>
+                        <p>加载中...</p>
+                    </div>
+                </div>
+                <div class="logs-footer">
+                    <span id="logsCount">共 0 条日志</span>
+                    <span id="logsLastUpdate">最后更新: -</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast 通知 -->
     <div class="toast-container" id="toastContainer"></div>
 
@@ -589,6 +758,6 @@
         <input type="file" id="hiddenFileInput" multiple>
     </form>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=1781873183"></script>
 </body>
 </html>

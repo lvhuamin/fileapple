@@ -446,7 +446,8 @@ class RAGFlowClient:
         self,
         question: str,
         dataset_id: str = None,
-        chat_id: str = None
+        chat_id: str = None,
+        history: List[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """RAG 对话完成"""
         try:
@@ -454,6 +455,11 @@ class RAGFlowClient:
                 "question": question,
                 "stream": False
             }
+
+            # 支持传入对话历史（RAGFlow API 支持 param_type=context 或作为 messages）
+            if history:
+                # 转换为 RAGFlow 期望的格式
+                payload["history"] = [{"role": h["role"], "content": h["content"]} for h in history]
 
             if dataset_id and not chat_id:
                 payload["dataset_ids"] = [dataset_id]

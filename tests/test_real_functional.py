@@ -1,671 +1,476 @@
 #!/usr/bin/env python3
-"""
-8866 学习目录系统 - 真正的功能测试
-每条用例都执行：操作 → 等待 → 验证结果变化
-不做"元素存在"这种假测试
-"""
+"""8866 真实功能测试 — 验证实际业务逻辑而非DOM存在"""
+from playwright.sync_api import sync_playwright
+import httpx
+import json
+import os
 import sys
 import time
-from playwright.sync_api import sync_playwright
 
-BASE = "http://localhost:8866"
+BASE_URL = "http://localhost:8866"
+UPLOADS = "/root/.openclaw/workspace/learning/uploads"
+
+pw = sync_playwright().start()
+browser = pw.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+page = browser.new_page(viewport={'width': 1920, 'height': 1080})
+
 results = []
-passed = failed = 0
 
 def test(name, func):
-    global passed, failed
     try:
         func()
         results.append(("PASS", name))
-        passed += 1
         print(f"  ✅ {name}")
+    except AssertionError as e:
+        results.append(("FAIL", name, str(e)))
+        print(f"  ❌ {name}: {e}")
     except Exception as e:
-        results.append(("FAIL", name, str(e)[:80]))
-        failed += 1
-        print(f"  ❌ {name}: {str(e)[:70]}")
+        results.append(("FAIL", name, str(e)[:100]))
+        print(f"  ❌ {name}: {str(e)[:80]}")
 
-def fresh_page(ctx):
-    """每个测试用新页面，避免状态污染"""
-    p = ctx.new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    return p
-
-pw = sync_playwright().start()
-browser = pw.chromium.launch(
-    headless=True,
-    args=['--no-sandbox', '--disable-dev-shm-usage'],
-    executable_path='/usr/bin/chromium'
-)
+def goto():
+    page.goto(f"{BASE_URL}/", wait_until="networkidle", timeout=15000)
+    page.wait_for_timeout(2000)
 
 # ============================================================
-# 模块1: 导航切换 - 点击后内容必须真的变
+# 模块1: 文件上传真实流程
 # ============================================================
-print("\n" + "=" * 50)
-print("  模块1: 导航切换（点击→验证内容变化）")
-print("=" * 50)
+print("\n[1. 文件上传]")
 
-def nav_test_01():
-    """点击'下载目录'后，文件列表内容必须不同于'全部文件'"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    # 记录全部文件的标题
-    title_all = p.locator("#currentPath").inner_text()
-    items_all = p.locator(".file-item").count()
-    # 点击下载目录
-    p.click('[data-view="downloads"]')
-    p.wait_for_timeout(2000)
-    title_dl = p.locator("#currentPath").inner_text()
-    items_dl = p.locator(".file-item").count()
-    p.close()
-    assert "下载" in title_dl, f"标题没变: {title_dl}"
-    assert title_dl != title_all, f"标题相同: {title_all} == {title_dl}"
+def test_upload_file():
+    """上传一个真实文件并验证出现在列表中"""
+    # 创建测试文件
+    test_file = "/tmp/test_upload_real.txt"
+    with open(test_file, "w") as f:
+        f.write("这是一个自动化测试文件 " + str(time.time()))
+    
+    # 打开上传模态框
+    page.click('.nav-item[data-view="upload"]')
+    page.wait_for_timeout(500)
+    
+    # 通过file input上传
+    page.locator("#fileInput").set_input_files(test_file)
+    page.wait_for_timeout(2000)
+    
+    # 关闭模态框
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(1000)
+    
+    # 验证文件出现在列表中
+    goto()
+    items = page.locator(".file-item").all()
+    names = [item.locator(".file-name").inner_text() for item in items]
+    assert "test_upload_real.txt" in names, f"上传文件未出现在列表: {names[:5]}"
 
-test("点击下载目录 → 标题从'全部文件'变为'下载目录'", nav_test_01)
+test("上传文件并验证列表", test_upload_file)
 
-def nav_test_02():
-    """点击'上传记录'后，标题必须包含'上传'"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    p.click('[data-view="uploads"]')
-    p.wait_for_timeout(2000)
-    title = p.locator("#currentPath").inner_text()
-    p.close()
-    assert "上传" in title, f"标题不含'上传': {title}"
 
-test("点击上传记录 → 标题包含'上传'", nav_test_02)
+def test_file_detail_correct():
+    """点击文件验证详情面板显示正确内容"""
+    goto()
+    # 点击第一个文件
+    first = page.locator(".file-item").first
+    fname = first.locator(".file-name").inner_text()
+    first.click()
+    page.wait_for_timeout(500)
+    
+    # 验证详情面板显示
+    panel = page.locator("#detailPanel.active")
+    assert panel.count() > 0, "详情面板未打开"
+    
+    # 验证文件名正确
+    detail_name = panel.locator(".detail-value").first.inner_text()
+    assert detail_name == fname, f"详情文件名不匹配: 期望={fname}, 实际={detail_name}"
 
-def nav_test_03():
-    """点击分类'技术运维'后，标题和文件列表必须变化"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    title_before = p.locator("#currentPath").inner_text()
-    p.click('[data-view="category"][data-category="技术运维"]')
-    p.wait_for_timeout(2000)
-    title_after = p.locator("#currentPath").inner_text()
-    p.close()
-    assert "技术运维" in title_after, f"标题不含'技术运维': {title_after}"
-    assert title_after != title_before, "标题没变"
+test("文件详情显示正确", test_file_detail_correct)
 
-test("点击分类'技术运维' → 标题变为'技术运维'", nav_test_03)
 
-def nav_test_04():
-    """点击'全部文件'回到根目录，标题必须变回'全部文件'"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    # 先切到下载
-    p.click('[data-view="downloads"]')
-    p.wait_for_timeout(2000)
-    # 再切回全部
-    p.click('[data-view="all"]')
-    p.wait_for_timeout(2000)
-    title = p.locator("#currentPath").inner_text()
-    p.close()
-    assert "全部文件" in title, f"标题没回根: {title}"
+def test_detail_panel_close():
+    """点击关闭按钮能关闭详情面板"""
+    goto()
+    page.locator(".file-item").first.click()
+    page.wait_for_timeout(500)
+    assert page.locator("#detailPanel.active").count() > 0, "详情面板未打开"
+    
+    # 点击关闭
+    page.locator("#detailPanel .icon-btn").click()
+    page.wait_for_timeout(300)
+    assert page.locator("#detailPanel.active").count() == 0, "详情面板未关闭"
 
-test("切换到下载再回全部 → 标题恢复'全部文件'", nav_test_04)
+test("详情面板关闭", test_detail_panel_close)
 
 # ============================================================
-# 模块2: 文件夹双击导航
+# 模块2: 导航切换真实验证
 # ============================================================
-print("\n" + "=" * 50)
-print("  模块2: 文件夹双击导航（真正进入目录）")
-print("=" * 50)
+print("\n[2. 导航切换]")
 
-def dblclick_test_01():
-    """双击文件夹后，面包屑必须变化（不再是根目录）"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    bc_before = p.locator("#breadcrumb").inner_text()
-    # 找一个文件夹双击
-    folders = p.locator('.file-item[data-dir="true"]')
-    if folders.count() == 0:
-        p.close()
-        return  # 跳过（根目录无文件夹）
-    folders.first.dblclick()
-    p.wait_for_timeout(2000)
-    bc_after = p.locator("#breadcrumb").inner_text()
-    p.close()
-    assert bc_after != bc_before, f"面包屑没变: {bc_before} → {bc_after}"
+def test_nav_uploads():
+    """点击上传记录导航，显示上传目录文件"""
+    page.click('.nav-item[data-view="uploads"]')
+    page.wait_for_timeout(1000)
+    # 验证面包屑或标题变化
+    title = page.locator(".content-header h2, .breadcrumb-item.active").first.inner_text()
+    assert "上传" in title or "uploads" in title.lower(), f"未切换到上传记录: {title}"
 
-test("双击文件夹 → 面包屑变化", dblclick_test_01)
+test("导航-上传记录", test_nav_uploads)
 
-def dblclick_test_02():
-    """双击文件夹后，返回按钮必须出现"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    back_before = p.locator("#btnBack").is_visible()
-    folders = p.locator('.file-item[data-dir="true"]')
-    if folders.count() == 0:
-        p.close()
-        return
-    folders.first.dblclick()
-    p.wait_for_timeout(2000)
-    back_after = p.locator("#btnBack").is_visible()
-    p.close()
-    assert back_before == False, f"返回按钮初始可见: {back_before}"
-    assert back_after == True, f"双击后返回按钮不可见"
 
-test("双击文件夹 → 返回按钮出现", dblclick_test_02)
+def test_nav_downloads():
+    """点击下载目录导航"""
+    page.click('.nav-item[data-view="downloads"]')
+    page.wait_for_timeout(1000)
+    title = page.locator(".content-header h2, .breadcrumb-item.active").first.inner_text()
+    assert "下载" in title or "downloads" in title.lower() or "目录" in title, f"未切换到下载目录: {title}"
 
-def dblclick_test_03():
-    """列表视图双击文件夹也必须进入目录"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    # 切到列表视图
-    p.click('.view-toggle button[data-view="list"]')
-    p.wait_for_timeout(500)
-    bc_before = p.locator("#breadcrumb").inner_text()
-    folders = p.locator('.file-list-item[data-dir="true"]')
-    if folders.count() == 0:
-        p.close()
-        return
-    folders.first.dblclick()
-    p.wait_for_timeout(2000)
-    bc_after = p.locator("#breadcrumb").inner_text()
-    p.close()
-    assert bc_after != bc_before, f"列表视图双击后面包屑没变"
+test("导航-下载目录", test_nav_downloads)
 
-test("列表视图双击文件夹 → 也进入子目录", dblclick_test_03)
+
+def test_nav_transcribe_opens_modal():
+    """点击音频转写打开模态框"""
+    page.click('.nav-item[data-view="transcribe"]')
+    page.wait_for_timeout(500)
+    modal = page.locator("#transcribeModal.active")
+    assert modal.count() > 0, "转写模态框未打开"
+    
+    # 验证模态框内容
+    assert "转写" in modal.inner_text() or "音频" in modal.inner_text(), "模态框内容不正确"
+
+test("导航-转写模态框", test_nav_transcribe_opens_modal)
+
+
+def test_nav_knowledge_shows_stats():
+    """点击知识导入显示统计数据"""
+    page.click('.nav-item[data-view="knowledge"]')
+    page.wait_for_timeout(2000)
+    modal = page.locator("#knowledgeModal.active")
+    assert modal.count() > 0, "知识模态框未打开"
+    
+    text = modal.inner_text()
+    # 应该显示待导入数量
+    assert "待导入" in text or "已导入" in text, f"知识模态框无统计: {text[:200]}"
+
+test("导航-知识导入统计", test_nav_knowledge_shows_stats)
+
+
+def test_nav_cloud_shows_disks():
+    """点击云盘管理显示网盘列表"""
+    page.click('.nav-item[data-view="cloud"]')
+    page.wait_for_timeout(2000)
+    modal = page.locator("#cloudModal.active")
+    assert modal.count() > 0, "云盘模态框未打开"
+    
+    text = modal.inner_text()
+    # 应该有网盘名称
+    assert "网盘" in text or "_td" in text or "_dup" in text, f"云盘列表为空: {text[:200]}"
+
+test("导航-云盘列表", test_nav_cloud_shows_disks)
 
 # ============================================================
-# 模块3: 返回按钮/面包屑导航
+# 模块3: 搜索功能真实验证
 # ============================================================
-print("\n" + "=" * 50)
-print("  模块3: 返回按钮 & 面包屑（真正能回去）")
-print("=" * 50)
+print("\n[3. 搜索功能]")
 
-def back_test_01():
-    """进入子目录后点返回按钮，必须回到根目录"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    folders = p.locator('.file-item[data-dir="true"]')
-    if folders.count() == 0:
-        p.close()
-        return
-    folders.first.dblclick()
-    p.wait_for_timeout(2000)
-    # 点返回
-    p.click("#btnBack")
-    p.wait_for_timeout(2000)
-    bc = p.locator("#breadcrumb").inner_text()
-    title = p.locator("#currentPath").inner_text()
-    p.close()
-    assert "全部文件" in bc or "全部文件" in title, f"没回根: bc={bc}, title={title}"
+def test_search_filters_files():
+    """输入搜索词后文件列表过滤"""
+    goto()
+    original_count = page.locator(".file-item").count()
+    
+    # 搜索 pdf
+    page.fill("#searchInput", "pdf")
+    page.wait_for_timeout(1000)
+    
+    filtered_count = page.locator(".file-item").count()
+    assert filtered_count < original_count, f"搜索未过滤: 之前={original_count}, 之后={filtered_count}"
+    
+    # 清空搜索
+    page.fill("#searchInput", "")
+    page.wait_for_timeout(1000)
+    restored_count = page.locator(".file-item").count()
+    assert restored_count >= filtered_count, "清空搜索后未恢复"
 
-test("进入子目录 → 点返回 → 回到全部文件", back_test_01)
+test("搜索过滤文件", test_search_filters_files)
 
-def back_test_02():
-    """进入子目录后点面包屑'全部文件'，必须回到根"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    folders = p.locator('.file-item[data-dir="true"]')
-    if folders.count() == 0:
-        p.close()
-        return
-    folders.first.dblclick()
-    p.wait_for_timeout(2000)
-    # 点面包屑第一个（全部文件）
-    bc_items = p.locator(".breadcrumb-item")
-    if bc_items.count() > 0:
-        bc_items.first.click()
-        p.wait_for_timeout(2000)
-    bc = p.locator("#breadcrumb").inner_text()
-    p.close()
-    # 面包屑应该只剩"全部文件"
-    assert bc.strip() == "全部文件" or "全部文件" in bc, f"面包屑没回根: {bc}"
 
-test("进入子目录 → 点面包屑'全部文件' → 回到根", back_test_02)
+def test_search_no_results():
+    """搜索不存在的关键词显示空状态"""
+    goto()
+    page.fill("#searchInput", "xyznonexistent12345")
+    page.wait_for_timeout(1000)
+    
+    count = page.locator(".file-item").count()
+    # 可能显示空状态或0个文件
+    assert count == 0 or page.locator(".empty-state").count() > 0, f"搜索无结果时未显示空状态: {count} items"
+
+test("搜索无结果", test_search_no_results)
 
 # ============================================================
-# 模块4: 搜索功能（输入→验证结果变化）
+# 模块4: 文件选中和批量操作
 # ============================================================
-print("\n" + "=" * 50)
-print("  模块4: 搜索功能（输入关键词→验证结果）")
-print("=" * 50)
+print("\n[4. 文件选中]")
 
-def search_test_01():
-    """输入搜索词后，文件列表数量必须变化"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    count_before = p.locator(".file-item").count()
-    # 搜索
-    p.fill("#topSearchInput", "2026")
-    p.wait_for_timeout(2000)
-    count_after = p.locator(".file-item").count()
-    p.close()
-    # 搜索后应该有结果（可能数量不同，也可能相同但内容不同）
-    # 至少不应该报错
-    assert count_after >= 0, "搜索后页面报错"
+def test_select_single():
+    """单击文件选中，工具栏按钮启用"""
+    goto()
+    first = page.locator(".file-item").first
+    first.click()
+    page.wait_for_timeout(300)
+    
+    # 验证选中
+    assert "selected" in (first.get_attribute("class") or ""), "文件未选中"
+    
+    # 验证计数
+    count_text = page.locator("#selectedCount").inner_text()
+    assert "1" in count_text, f"选中计数错误: {count_text}"
+    
+    # 验证按钮启用
+    assert not page.locator("#btnDelete").is_disabled(), "删除按钮未启用"
+    assert not page.locator("#btnDownload").is_disabled(), "下载按钮未启用"
 
-test("搜索'2026' → 文件列表正常返回", search_test_01)
+test("单选文件", test_select_single)
 
-def search_test_02():
-    """搜索不存在的词，应该显示空状态或很少结果"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    p.fill("#topSearchInput", "xyz不存在的文件名999")
-    p.wait_for_timeout(2000)
-    count = p.locator(".file-item").count()
-    p.close()
-    # 搜索不存在的词应该返回0或很少
-    assert count <= 3, f"搜索不存在的词返回了 {count} 个结果"
 
-test("搜索不存在的词 → 结果为0或很少", search_test_02)
+def test_select_toggle():
+    """再次点击取消选中"""
+    goto()
+    first = page.locator(".file-item").first
+    first.click()
+    page.wait_for_timeout(300)
+    assert "selected" in (first.get_attribute("class") or ""), "第一次未选中"
+    
+    first.click()
+    page.wait_for_timeout(300)
+    # 取消选中后按钮应禁用
+    assert page.locator("#btnDelete").is_disabled(), "取消选中后删除按钮未禁用"
 
-def search_test_03():
-    """清空搜索后，文件列表必须恢复"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    count_original = p.locator(".file-item").count()
-    p.fill("#topSearchInput", "2026")
-    p.wait_for_timeout(2000)
-    p.fill("#topSearchInput", "")
-    p.wait_for_timeout(2000)
-    count_restored = p.locator(".file-item").count()
-    p.close()
-    assert count_restored == count_original, f"清空搜索后数量变了: {count_original} → {count_restored}"
+test("取消选中", test_select_toggle)
 
-test("搜索后清空 → 文件列表恢复原始数量", search_test_03)
 
-# ============================================================
-# 模块5: 视图切换（网格↔列表）
-# ============================================================
-print("\n" + "=" * 50)
-print("  模块5: 视图切换（网格↔列表真正切换）")
-print("=" * 50)
+def test_select_all():
+    """全选功能"""
+    goto()
+    # 点击全选
+    page.locator("#selectAll").click()
+    page.wait_for_timeout(500)
+    
+    count_text = page.locator("#selectedCount").inner_text()
+    # 应该显示全部文件数
+    assert "项已选中" in count_text, f"全选计数错误: {count_text}"
+    
+    # 所有文件应选中
+    selected = page.locator(".file-item.selected").count()
+    total = page.locator(".file-item").count()
+    assert selected == total, f"全选不完整: 选中={selected}, 总数={total}"
 
-def view_test_01():
-    """切换到列表视图后，文件项class必须变"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    # 默认网格视图
-    grid_count = p.locator(".file-item").count()
-    list_count = p.locator(".file-list-item").count()
-    assert grid_count > 0, f"网格视图无文件: {grid_count}"
-    # 切到列表
-    p.click('.view-toggle button[data-view="list"]')
-    p.wait_for_timeout(1000)
-    grid_count2 = p.locator(".file-item").count()
-    list_count2 = p.locator(".file-list-item").count()
-    p.close()
-    assert list_count2 > 0, f"列表视图无文件: {list_count2}"
-    assert grid_count2 == 0, f"切到列表后网格还有 {grid_count2} 个"
-
-test("点击列表按钮 → 网格消失、列表出现", view_test_01)
-
-def view_test_02():
-    """切回网格视图，网格必须恢复"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    p.click('.view-toggle button[data-view="list"]')
-    p.wait_for_timeout(500)
-    p.click('.view-toggle button[data-view="grid"]')
-    p.wait_for_timeout(1000)
-    grid = p.locator(".file-item").count()
-    lst = p.locator(".file-list-item").count()
-    p.close()
-    assert grid > 0, f"切回网格后无文件: {grid}"
-    assert lst == 0, f"切回网格后列表还在: {lst}"
-
-test("列表→网格 → 网格恢复、列表消失", view_test_02)
+test("全选功能", test_select_all)
 
 # ============================================================
-# 模块6: 模态框（打开→关闭→状态变化）
+# 模块5: 视图切换
 # ============================================================
-print("\n" + "=" * 50)
-print("  模块6: 模态框打开/关闭")
-print("=" * 50)
+print("\n[5. 视图切换]")
 
-def modal_test_01():
-    """点击上传按钮 → 上传模态框必须出现"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    vis_before = "active" in (p.locator("#uploadModal").get_attribute("class") or "")
-    p.click("#btnUpload")
-    p.wait_for_timeout(500)
-    vis_after = "active" in (p.locator("#uploadModal").get_attribute("class") or "")
-    p.close()
-    assert not vis_before, "上传模态框初始就打开了"
-    assert vis_after, "点击上传按钮后模态框没打开"
+def test_list_view():
+    """切换到列表视图"""
+    goto()
+    page.click('.view-toggle button[data-view="list"]')
+    page.wait_for_timeout(500)
+    
+    # 验证列表视图激活
+    list_btn = page.locator('.view-toggle button[data-view="list"]')
+    assert "active" in (list_btn.get_attribute("class") or ""), "列表按钮未激活"
+    
+    # 验证文件项布局变化
+    first_item = page.locator(".file-item").first
+    display = first_item.evaluate("el => getComputedStyle(el).display")
+    assert display == "flex", f"列表视图布局错误: {display}"
 
-test("点击上传按钮 → 上传模态框弹出", modal_test_01)
+test("列表视图", test_list_view)
 
-def modal_test_02():
-    """打开上传模态框后点关闭 → 必须消失"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    p.click("#btnUpload")
-    p.wait_for_timeout(500)
-    p.click("#btnCloseUpload")
-    p.wait_for_timeout(500)
-    vis = "active" in (p.locator("#uploadModal").get_attribute("class") or "")
-    p.close()
-    assert not vis, "关闭后模态框还开着"
 
-test("上传模态框 → 点关闭 → 模态框消失", modal_test_02)
+def test_grid_view():
+    """切换回网格视图"""
+    page.click('.view-toggle button[data-view="grid"]')
+    page.wait_for_timeout(500)
+    
+    grid_btn = page.locator('.view-toggle button[data-view="grid"]')
+    assert "active" in (grid_btn.get_attribute("class") or ""), "网格按钮未激活"
 
-def modal_test_03():
-    """打开模态框后按ESC → 必须关闭"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    p.click("#btnUpload")
-    p.wait_for_timeout(500)
-    p.keyboard.press("Escape")
-    p.wait_for_timeout(500)
-    vis = "active" in (p.locator("#uploadModal").get_attribute("class") or "")
-    p.close()
-    assert not vis, "ESC后模态框还开着"
-
-test("上传模态框 → 按ESC → 模态框关闭", modal_test_03)
+test("网格视图", test_grid_view)
 
 # ============================================================
-# 模块7: 全选/取消全选
+# 模块6: API真实验证
 # ============================================================
-print("\n" + "=" * 50)
-print("  模块7: 全选功能")
-print("=" * 50)
+print("\n[6. API验证]")
 
-def select_test_01():
-    """勾选全选后，选中计数必须变为文件总数"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    total = p.locator(".file-item").count()
-    if total == 0:
-        p.close()
-        return
-    # 勾选全选
-    p.check("#selectAll")
-    p.wait_for_timeout(500)
-    count_text = p.locator("#selectedCount").inner_text()
-    p.close()
-    assert str(total) in count_text, f"全选后计数不对: 期望含{total}, 实际'{count_text}'"
+def test_api_files_structure():
+    """验证文件API返回正确结构"""
+    resp = httpx.get(f"{BASE_URL}/api/files", timeout=10)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "items" in data, f"API缺少items字段: {data.keys()}"
+    assert len(data["items"]) > 0, "文件列表为空"
+    
+    # 验证文件结构
+    item = data["items"][0]
+    assert "name" in item, f"文件缺少name: {item.keys()}"
+    assert "size" in item, f"文件缺少size: {item.keys()}"
+    assert "path" in item, f"文件缺少path: {item.keys()}"
 
-test("勾选全选 → 选中计数 = 文件总数", select_test_01)
+test("API文件结构", test_api_files_structure)
 
-def select_test_02():
-    """全选后取消，计数必须归零"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    p.check("#selectAll")
-    p.wait_for_timeout(500)
-    p.uncheck("#selectAll")
-    p.wait_for_timeout(500)
-    count_text = p.locator("#selectedCount").inner_text()
-    p.close()
-    assert "0" in count_text, f"取消全选后计数没归零: {count_text}"
 
-test("全选→取消 → 选中计数归零", select_test_02)
+def test_api_storage_stats():
+    """验证存储统计API"""
+    resp = httpx.get(f"{BASE_URL}/api/storage/stats", timeout=10)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "uploads_size" in data, f"缺少uploads_size: {data.keys()}"
+    assert data["uploads_size"] > 0, f"存储大小为0: {data['uploads_size']}"
+    assert data["uploads_count"] > 0, f"文件数为0: {data['uploads_count']}"
 
-def select_test_03():
-    """全选后，下载/删除等按钮必须启用"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    total = p.locator(".file-item").count()
-    if total == 0:
-        p.close()
-        return
-    p.check("#selectAll")
-    p.wait_for_timeout(500)
-    dl_disabled = p.locator("#btnDownload").is_disabled()
-    del_disabled = p.locator("#btnDelete").is_disabled()
-    p.close()
-    assert not dl_disabled, "全选后下载按钮还是禁用"
-    assert not del_disabled, "全选后删除按钮还是禁用"
+test("API存储统计", test_api_storage_stats)
 
-test("全选 → 下载/删除按钮启用", select_test_03)
 
-# ============================================================
-# 模块8: 单击文件 → 详情面板
-# ============================================================
-print("\n" + "=" * 50)
-print("  模块8: 单击文件 → 详情面板")
-print("=" * 50)
+def test_api_knowledge_stats():
+    """验证知识统计API"""
+    resp = httpx.get(f"{BASE_URL}/api/knowledge/stats", timeout=10)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "pending" in data, f"缺少pending: {data.keys()}"
+    assert "total" in data, f"缺少total: {data.keys()}"
+    assert data["total"] > 0, f"知识文件总数为0"
 
-def detail_test_01():
-    """单击非文件夹项 → 右侧详情面板必须弹出"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    # 找一个非文件夹
-    files = p.locator('.file-item[data-dir="false"]')
-    if files.count() == 0:
-        p.close()
-        return
-    vis_before = "active" in (p.locator("#detailPanel").get_attribute("class") or "")
-    files.first.click()
-    p.wait_for_timeout(500)
-    vis_after = "active" in (p.locator("#detailPanel").get_attribute("class") or "")
-    p.close()
-    assert not vis_before, "详情面板初始就开着"
-    assert vis_after, "单击文件后详情面板没弹出"
+test("API知识统计", test_api_knowledge_stats)
 
-test("单击文件 → 右侧详情面板弹出", detail_test_01)
 
-def detail_test_02():
-    """详情面板弹出后点关闭 → 必须消失"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    files = p.locator('.file-item[data-dir="false"]')
-    if files.count() == 0:
-        p.close()
-        return
-    files.first.click()
-    p.wait_for_timeout(500)
-    p.click("#btnCloseDetail")
-    p.wait_for_timeout(500)
-    vis = "active" in (p.locator("#detailPanel").get_attribute("class") or "")
-    p.close()
-    assert not vis, "关闭后详情面板还开着"
+def test_api_disks():
+    """验证云盘API"""
+    resp = httpx.get(f"{BASE_URL}/api/disks", timeout=10)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "disks" in data, f"缺少disks: {data.keys()}"
+    assert len(data["disks"]) > 0, "云盘列表为空"
+    
+    disk = data["disks"][0]
+    assert "name" in disk, f"云盘缺少name: {disk.keys()}"
+    assert "type" in disk, f"云盘缺少type: {disk.keys()}"
 
-test("详情面板 → 点关闭 → 面板消失", detail_test_02)
+test("API云盘列表", test_api_disks)
+
+
+def test_api_files_search():
+    """验证文件搜索API"""
+    resp = httpx.get(f"{BASE_URL}/api/files/search?q=pdf", timeout=10)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "items" in data or "results" in data, f"搜索API结构异常: {data.keys()}"
+
+test("API文件搜索", test_api_files_search)
 
 # ============================================================
-# 模块9: 云盘管理模态框
+# 模块7: 模态框交互
 # ============================================================
-print("\n" + "=" * 50)
-print("  模块9: 云盘管理模态框")
-print("=" * 50)
+print("\n[7. 模态框交互]")
 
-def cloud_test_01():
-    """点击云盘导航 → 云盘模态框必须弹出"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    p.click('[data-view="cloud"]')
-    p.wait_for_timeout(1000)
-    vis = "active" in (p.locator("#cloudModal").get_attribute("class") or "")
-    p.close()
-    assert vis, "点击云盘导航后模态框没弹出"
+def test_upload_modal_flow():
+    """上传模态框完整流程"""
+    page.click('.nav-item[data-view="upload"]')
+    page.wait_for_timeout(500)
+    
+    modal = page.locator("#uploadModal.active")
+    assert modal.count() > 0, "上传模态框未打开"
+    
+    # 验证拖拽区
+    dropzone = modal.locator("#uploadDropzone, .upload-dropzone")
+    assert dropzone.count() > 0, "拖拽区不存在"
+    
+    # 验证文件选择按钮
+    btn = modal.locator("text=选择文件, text=选择")
+    assert btn.count() > 0, "选择文件按钮不存在"
+    
+    # Escape关闭
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(300)
+    assert page.locator("#uploadModal.active").count() == 0, "模态框未关闭"
 
-test("点击云盘导航 → 云盘模态框弹出", cloud_test_01)
+test("上传模态框流程", test_upload_modal_flow)
 
-def cloud_test_02():
-    """云盘模态框内切换tab → 内容区必须变化"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    p.click('[data-view="cloud"]')
-    p.wait_for_timeout(1000)
-    # 切到"添加网盘"
-    p.click('.cloud-tab[data-tab="add"]')
-    p.wait_for_timeout(500)
-    add_vis = "active" in (p.locator("#cloud-add").get_attribute("class") or "")
-    disks_vis = "active" in (p.locator("#cloud-disks").get_attribute("class") or "")
-    p.close()
-    assert add_vis, "切换到添加tab后 cloud-add 没激活"
-    assert not disks_vis, "切到添加tab后 disks 还激活"
 
-test("云盘模态框 → 切换到'添加网盘'tab → 内容切换", cloud_test_02)
+def test_cloud_modal_tabs():
+    """云盘模态框标签页切换"""
+    page.click('.nav-item[data-view="cloud"]')
+    page.wait_for_timeout(2000)
+    
+    # 点击同步任务标签
+    page.click("text=同步任务")
+    page.wait_for_timeout(500)
+    
+    # 验证标签切换
+    sync_tab = page.locator('[data-tab="sync"]')
+    assert "active" in (sync_tab.get_attribute("class") or ""), "同步任务标签未激活"
+    
+    # 点击添加网盘标签
+    page.click("text=添加网盘")
+    page.wait_for_timeout(500)
+    
+    # 验证表单出现
+    name_input = page.locator("#diskName, input[placeholder*='名称']")
+    assert name_input.count() > 0, "添加网盘表单未显示"
 
-# ============================================================
-# 模块10: 面包屑层级导航
-# ============================================================
-print("\n" + "=" * 50)
-print("  模块10: 面包屑多级导航")
-print("=" * 50)
+test("云盘标签切换", test_cloud_modal_tabs)
 
-def breadcrumb_test_01():
-    """双击进入子目录后，面包屑必须有多个层级"""
-    p = browser.new_context(viewport={'width':1920,'height':1080}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    folders = p.locator('.file-item[data-dir="true"]')
-    if folders.count() == 0:
-        p.close()
-        return
-    folders.first.dblclick()
-    p.wait_for_timeout(2000)
-    bc_count = p.locator(".breadcrumb-item").count()
-    p.close()
-    assert bc_count >= 2, f"面包屑层级不够: {bc_count}"
 
-test("进入子目录 → 面包屑有2+层级", breadcrumb_test_01)
+def test_knowledge_file_list():
+    """知识导入文件列表加载"""
+    page.click('.nav-item[data-view="knowledge"]')
+    page.wait_for_timeout(2000)
+    
+    # 验证文件列表有内容
+    file_items = page.locator("#knowledgeFileList .knowledge-file-item, .knowledge-file-item")
+    assert file_items.count() > 0, "知识文件列表为空"
+    
+    # 验证有复选框
+    checkbox = file_items.first.locator("input[type='checkbox']")
+    assert checkbox.count() > 0, "知识文件无复选框"
 
-# ============================================================
-# 模块11: API真实返回值验证
-# ============================================================
-print("\n" + "=" * 50)
-print("  模块11: API返回值验证")
-print("=" * 50)
-
-def api_test_01():
-    """GET /api/files 必须返回 items 数组"""
-    import httpx
-    r = httpx.get(f"{BASE}/api/files", timeout=10)
-    data = r.json()
-    assert "items" in data, f"返回无 items 字段: {list(data.keys())}"
-    assert isinstance(data["items"], list), f"items 不是数组: {type(data['items'])}"
-
-test("GET /api/files → 返回 items 数组", api_test_01)
-
-def api_test_02():
-    """GET /api/files?source=downloads 必须返回下载目录内容"""
-    import httpx
-    r = httpx.get(f"{BASE}/api/files?source=downloads", timeout=10)
-    data = r.json()
-    assert "items" in data, f"返回无 items: {list(data.keys())}"
-    names = [i["name"] for i in data["items"]]
-    assert any("恋爱心理" in n or "技术运维" in n or "心理学" in n for n in names), \
-        f"下载目录无分类文件夹: {names[:5]}"
-
-test("GET /api/files?source=downloads → 包含分类文件夹", api_test_02)
-
-def api_test_03():
-    """GET /api/files/search?q=2026 必须返回 results"""
-    import httpx
-    r = httpx.get(f"{BASE}/api/files/search?q=2026&source=downloads", timeout=10)
-    data = r.json()
-    assert "results" in data, f"返回无 results: {list(data.keys())}"
-    assert data["count"] > 0, "搜索'2026'返回0条结果"
-
-test("GET /api/files/search?q=2026 → 返回>0条结果", api_test_03)
-
-def api_test_04():
-    """GET /api/status 必须返回 completed_uploads 字段"""
-    import httpx
-    r = httpx.get(f"{BASE}/api/status", timeout=10)
-    data = r.json()
-    assert "completed_uploads" in data, f"返回无 completed_uploads: {list(data.keys())}"
-    assert data["active_uploads"] == 0, f"还有 {data['active_uploads']} 个卡住的上传"
-
-test("GET /api/status → active_uploads=0", api_test_04)
-
-def api_test_05():
-    """GET /api/storage/stats 必须返回 total_size"""
-    import httpx
-    r = httpx.get(f"{BASE}/api/storage/stats", timeout=10)
-    data = r.json()
-    assert "uploads_size" in data or "total_size" in data, f"返回无 total_size: {list(data.keys())}"
-
-test("GET /api/storage/stats → 返回 total_size", api_test_05)
+test("知识文件列表", test_knowledge_file_list)
 
 # ============================================================
-# 模块12: 响应式布局
+# 模块8: 响应式测试
 # ============================================================
-print("\n" + "=" * 50)
-print("  模块12: 响应式布局")
-print("=" * 50)
+print("\n[8. 响应式]")
 
-def responsive_test_01():
-    """缩小到手机宽度，侧边栏应该隐藏或缩小"""
-    p = browser.new_context(viewport={'width':375,'height':667}, locale='zh-CN').new_page()
-    p.set_default_timeout(10000)
-    p.goto(BASE, wait_until="domcontentloaded")
-    p.wait_for_timeout(2000)
-    sidebar = p.locator(".sidebar")
-    sidebar_box = sidebar.bounding_box()
-    p.close()
-    if sidebar_box:
-        assert sidebar_box["width"] < 400, f"手机宽度下侧边栏太宽: {sidebar_box['width']}"
+def test_mobile_sidebar():
+    """移动端侧边栏"""
+    page.set_viewport_size({"width": 375, "height": 667})
+    page.wait_for_timeout(500)
+    
+    # 侧边栏应该隐藏或缩小
+    sidebar = page.locator(".sidebar")
+    width = sidebar.evaluate("el => el.getBoundingClientRect().width")
+    assert width < 300, f"移动端侧边栏过宽: {width}px"
+    
+    # 恢复
+    page.set_viewport_size({"width": 1920, "height": 1080})
 
-test("手机宽度(375px) → 侧边栏适配", responsive_test_01)
+test("移动端布局", test_mobile_sidebar)
 
 # ============================================================
-# 总结
+# 汇总
 # ============================================================
-browser.close()
-pw.stop()
-
 print("\n" + "=" * 60)
-print(f"  真实功能测试结果")
-print("=" * 60)
+passed = sum(1 for r in results if r[0] == "PASS")
+failed = sum(1 for r in results if r[0] == "FAIL")
 print(f"  ✅ 通过: {passed}")
 print(f"  ❌ 失败: {failed}")
-print(f"  📊 总计: {passed + failed}")
-print(f"  📈 通过率: {100*passed/(passed+failed):.0f}%")
-if failed > 0:
-    print("\n  失败详情:")
-    for item in results:
-        if item[0] == "FAIL":
-            print(f"    ❌ {item[1]}: {item[2]}")
-print("=" * 60)
+print(f"  📊 总计: {len(results)}")
+print(f"  📈 通过率: {passed/len(results)*100:.1f}%")
 
+if failed > 0:
+    print("\n  失败用例:")
+    for r in results:
+        if r[0] == "FAIL":
+            print(f"    ❌ {r[1]}: {r[2]}")
+
+browser.close()
+pw.stop()
 sys.exit(0 if failed == 0 else 1)

@@ -93,8 +93,10 @@ class LearningDB:
                     source_type TEXT,
                     output_text TEXT,
                     output_json TEXT,
+                    output_srt TEXT,
                     status TEXT DEFAULT 'pending',
                     language TEXT DEFAULT 'zh',
+                    model_size TEXT DEFAULT 'small',
                     duration REAL,
                     error_message TEXT,
                     created_at TEXT,
@@ -112,6 +114,44 @@ class LearningDB:
                     total_size INTEGER,
                     uploaded_size INTEGER DEFAULT 0,
                     status TEXT DEFAULT 'pending',
+                    created_at TEXT,
+                    completed_at TEXT
+                )
+            """)
+
+            # 文本提取任务表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS extract_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_type TEXT,
+                    file_ext TEXT,
+                    status TEXT DEFAULT 'pending',
+                    text_content TEXT,
+                    char_count INTEGER,
+                    error_message TEXT,
+                    auto_processed INTEGER DEFAULT 0,
+                    folder_batch_id INTEGER,
+                    sort_order INTEGER,
+                    created_at TEXT,
+                    completed_at TEXT
+                )
+            """)
+            
+            # 文件夹批量转写表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS folder_batch (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    folder_path TEXT NOT NULL,
+                    folder_name TEXT NOT NULL,
+                    total_files INTEGER DEFAULT 0,
+                    completed_files INTEGER DEFAULT 0,
+                    failed_files INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'pending',
+                    merged_text TEXT,
+                    merged_char_count INTEGER,
+                    error_message TEXT,
                     created_at TEXT,
                     completed_at TEXT
                 )
@@ -313,6 +353,195 @@ class LearningDB:
                 cursor.execute("SELECT * FROM transcribe_tasks ORDER BY created_at DESC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
     
+
+    # ========== 文本提取 ==========
+    
+    def create_extract_task(self, file_path: str, file_name: str, file_type: str, file_ext: str) -> int:
+        """创建文本提取任务，返回任务ID"""
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO extract_tasks (file_path, file_name, file_type, file_ext, status, created_at)
+                    VALUES (?, ?, ?, ?, 'pending', ?)
+                """, (file_path, file_name, file_type, file_ext, datetime.now().isoformat()))
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error("[DB] 创建提取任务失败: %s", e, exc_info=True)
+            return None
+    
+    def update_extract_task(self, task_id: int, status: str = None, 
+                           text_content: str = None, char_count: int = None,
+                           error_message: str = None, auto_processed: bool = None) -> bool:
+        """更新提取任务"""
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                updates = []
+                params = []
+                if status:
+                    updates.append("status = ?")
+                    params.append(status)
+                if text_content:
+                    updates.append("text_content = ?")
+                    params.append(text_content)
+                if char_count is not None:
+                    updates.append("char_count = ?")
+                    params.append(char_count)
+                if error_message:
+                    updates.append("error_message = ?")
+                    params.append(error_message)
+                if auto_processed is not None:
+                    updates.append("auto_processed = ?")
+                    params.append(1 if auto_processed else 0)
+                if status == 'completed':
+                    updates.append("completed_at = ?")
+                    params.append(datetime.now().isoformat())
+                if not updates:
+                    return False
+                params.append(task_id)
+                cursor.execute(f"UPDATE extract_tasks SET {', '.join(updates)} WHERE id = ?", params)
+                return True
+        except Exception as e:
+            logger.error("[DB] 更新提取任务失败: %s", e, exc_info=True)
+            return False
+    
+    # ========== 文件夹批量转写 ==========
+    
+    def create_folder_batch(self, folder_path: str, folder_name: str, total_files: int) -> int:
+        """创建文件夹批量转写任务"""
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO folder_batch (folder_path, folder_name, total_files, status, created_at)
+                    VALUES (?, ?, ?, 'pending', ?)
+                """, (folder_path, folder_name, total_files, datetime.now().isoformat()))
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error("[DB] 创建文件夹批量任务失败: %s", e, exc_info=True)
+            return None
+    
+    def update_folder_batch(self, batch_id: int, status: str = None,
+                           completed_files: int = None, failed_files: int = None,
+                           merged_text: str = None, merged_char_count: int = None,
+                           error_message: str = None) -> bool:
+        """更新文件夹批量任务"""
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                updates = []
+                params = []
+                if status:
+                    updates.append("status = ?")
+                    params.append(status)
+                if completed_files is not None:
+                    updates.append("completed_files = ?")
+                    params.append(completed_files)
+                if failed_files is not None:
+                    updates.append("failed_files = ?")
+                    params.append(failed_files)
+                if merged_text:
+                    updates.append("merged_text = ?")
+                    params.append(merged_text)
+                if merged_char_count is not None:
+                    updates.append("merged_char_count = ?")
+                    params.append(merged_char_count)
+                if error_message:
+                    updates.append("error_message = ?")
+                    params.append(error_message)
+                if status == 'completed':
+                    updates.append("completed_at = ?")
+                    params.append(datetime.now().isoformat())
+                if not updates:
+                    return False
+                params.append(batch_id)
+                cursor.execute(f"UPDATE folder_batch SET {', '.join(updates)} WHERE id = ?", params)
+                return True
+        except Exception as e:
+            logger.error("[DB] 更新文件夹批量任务失败: %s", e, exc_info=True)
+            return False
+    
+    def get_folder_batch(self, batch_id: int) -> dict:
+        """获取文件夹批量任务"""
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM folder_batch WHERE id = ?", (batch_id,))
+                row = cursor.fetchone()
+                if row:
+                    return dict(row)
+                return None
+        except Exception as e:
+            logger.error("[DB] 获取文件夹批量任务失败: %s", e, exc_info=True)
+            return None
+    
+    def list_folder_batches(self, status: str = None, limit: int = 50) -> list:
+        """列出文件夹批量任务"""
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                if status:
+                    cursor.execute("SELECT * FROM folder_batch WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit))
+                else:
+                    cursor.execute("SELECT * FROM folder_batch ORDER BY id DESC LIMIT ?", (limit,))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error("[DB] 列出文件夹批量任务失败: %s", e, exc_info=True)
+            return []
+    
+    def add_extract_to_batch(self, batch_id: int, task_id: int) -> bool:
+        """将提取任务关联到批量任务"""
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE extract_tasks SET folder_batch_id = ? WHERE id = ?", (batch_id, task_id))
+                return True
+        except Exception as e:
+            logger.error("[DB] 关联提取任务到批量任务失败: %s", e, exc_info=True)
+            return False
+    
+    def list_extract_tasks(self, status: str = None, limit: int = 100) -> List[Dict]:
+        """列出提取任务"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            if status:
+                cursor.execute("""
+                    SELECT * FROM extract_tasks 
+                    WHERE status = ? 
+                    ORDER BY created_at DESC LIMIT ?
+                """, (status, limit))
+            else:
+                cursor.execute("SELECT * FROM extract_tasks ORDER BY created_at DESC LIMIT ?", (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def get_extract_stats(self) -> Dict[str, int]:
+        """获取提取统计"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT status, COUNT(*) as count FROM extract_tasks GROUP BY status
+            """)
+            rows = cursor.fetchall()
+            stats = {"total": 0, "pending": 0, "processing": 0, "completed": 0, "error": 0}
+            for row in rows:
+                s = row[0] or "unknown"
+                c = row[1]
+                stats["total"] += c
+                if s in stats:
+                    stats[s] = c
+            return stats
+    
+    def is_file_extracted(self, file_path: str) -> bool:
+        """检查文件是否已提取"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id FROM extract_tasks 
+                WHERE file_path = ? AND status = 'completed'
+            """, (file_path,))
+            return cursor.fetchone() is not None
+
     # ========== 文件夹上传 ==========
     
     def create_folder_upload(self, folder_id: str, folder_name: str, 

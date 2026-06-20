@@ -1,12 +1,15 @@
 """
-智能文本切片 — 支持重叠、按段落/标题分割
+智能文本切片 — 按标题/段落/句子三级分割，保证语义完整
 输出切片列表，每个切片带元信息
 """
 import re
 import logging
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 logger = logging.getLogger("ingestion.chunker")
+
+# 句子分隔符（按优先级）
+_SENT_SEPS = re.compile(r'(?<=[。！？；\n])\s*')
 
 
 def chunk(
@@ -17,73 +20,78 @@ def chunk(
 ) -> List[Dict]:
     """
     将长文本切分为知识块。
-    按标题/段落自然分割，再按 token 上限截断。
+
+    分割策略（优先级从高到低）：
+      1. 按标题分割
+      2. 按段落（空行）分割
+      3. 按句子分割
+      4. 兜底：按字符截断（仅当单句超长时）
+
+    overlap：只取上一片最后一个完整句子作为上下文，不重复拼接。
 
     返回:
-    [
-        {
-            "index": 0,
-            "text": "...",
-            "char_start": 0,
-            "char_end": 500,
-            "approx_tokens": 120,
-            "has_title": True
-        },
-        ...
-    ]
+        [{"index": 0, "text": "...", "char_start": 0, "char_end": 500,
+          "approx_tokens": 120, "has_title": True}, ...]
     """
     if not text or not text.strip():
         logger.warning("empty text for %s", source)
         return []
 
-    # 按标题/空行分割为自然段落
+    # Step 1: 按标题分割为大段
     sections = _split_by_heading(text)
 
+    # Step 2: 对每个大段，按段落 → 句子 逐级填充
+    all_units: List[Tuple[str, int, bool]] = []  # (text, char_start, has_title)
+    for sec_text, sec_start, sec_has_title in sections:
+        if _approx_tokens(sec_text) <= max_tokens:
+            all_units.append((sec_text, sec_start, sec_has_title))
+        else:
+            # 大段内部：按段落分割，段落内按句子分割
+            sub_units = _split_section_to_units(sec_text, sec_start, sec_has_title)
+            all_units.extend(sub_units)
+
+    # Step 3: 贪心合并 units 到 chunks
     chunks = []
     buffer = ""
     buffer_start = 0
+    buffer_has_title = False
 
-    for sec_text, sec_start, sec_has_title in sections:
-        sec_tokens = _approx_tokens(sec_text)
+    for unit_text, unit_start, unit_has_title in all_units:
+        unit_tokens = _approx_tokens(unit_text)
 
-        # 如果单段本身超过上限，强制按 token 分割
-        if sec_tokens > max_tokens:
-            # 先 flush 现有 buffer
+        # 单个 unit 就超限 → 直接作为独立 chunk（内部已尽力分割）
+        if unit_tokens > max_tokens:
+            # 先 flush buffer
             if buffer.strip():
-                _flush_chunk(chunks, buffer, buffer_start, sec_has_title)
-            sub_pieces = _split_text_by_tokens(sec_text, max_tokens)
-            for i, piece in enumerate(sub_pieces):
-                has_title = sec_has_title and i == 0
-                piece_start = sec_start + sec_text.index(piece)
-                # 非首片：保留 overlap
-                if i > 0:
-                    overlap = _tail_by_tokens(chunks[-1]["text"], overlap_tokens) if chunks else ""
-                    piece = overlap + piece
-                    piece_start = piece_start - len(overlap)
-                _flush_chunk(chunks, piece, piece_start, has_title)
-            buffer = ""
-            buffer_start = 0
-            continue
-
-        # buffer + 当前段超过上限 → 先 flush buffer
-        if buffer and _approx_tokens(buffer + sec_text) > max_tokens:
-            _flush_chunk(chunks, buffer, buffer_start, sec_has_title)
-            # 保留末尾 overlap 作为新 buffer
-            overlap_text = _tail_by_tokens(buffer, overlap_tokens)
-            if overlap_text:
-                buffer = overlap_text
-                buffer_start = buffer_start + len(buffer) - len(overlap_text)
-            else:
+                _flush_chunk(chunks, buffer, buffer_start, buffer_has_title)
                 buffer = ""
                 buffer_start = 0
+            _flush_chunk(chunks, unit_text, unit_start, unit_has_title)
+            continue
 
-        if not buffer:
-            buffer_start = sec_start
-        buffer += sec_text
+        # buffer + unit 超限 → flush buffer，unit 进新 buffer
+        if buffer and _approx_tokens(buffer + "\n" + unit_text) > max_tokens:
+            _flush_chunk(chunks, buffer, buffer_start, buffer_has_title)
+            # 新 buffer 以当前 unit 开始（不带 overlap，避免重复）
+            buffer = unit_text
+            buffer_start = unit_start
+            buffer_has_title = unit_has_title
+        else:
+            # 合并到 buffer
+            if not buffer:
+                buffer_start = unit_start
+                buffer_has_title = unit_has_title
+                buffer = unit_text
+            else:
+                buffer = buffer + "\n" + unit_text
 
-    # 最后一段
+    # flush 剩余
     if buffer.strip():
-        _flush_chunk(chunks, buffer, buffer_start, False)
+        _flush_chunk(chunks, buffer, buffer_start, buffer_has_title)
+
+    # Step 4: 添加 overlap（上一片最后一个完整句子）
+    if overlap_tokens > 0 and len(chunks) > 1:
+        _add_overlap(chunks, overlap_tokens)
 
     logger.info("chunked %s: %d chars → %d chunks", source, len(text), len(chunks))
     return chunks
@@ -104,28 +112,95 @@ def _flush_chunk(chunks: list, text: str, start: int, has_title: bool):
     })
 
 
-# ── 辅助函数 ────────────────────────────────────────────
+def _add_overlap(chunks: List[Dict], overlap_tokens: int):
+    """给每个 chunk（除第一个）的开头添加上一片最后一个完整句子作为上下文"""
+    for i in range(1, len(chunks)):
+        prev_text = chunks[i - 1]["text"]
+        # 从上一片末尾提取最后一个完整句子
+        last_sentence = _extract_last_sentence(prev_text)
+        if last_sentence and _approx_tokens(last_sentence) <= overlap_tokens:
+            chunks[i]["text"] = last_sentence + " " + chunks[i]["text"]
+            chunks[i]["overlap_from"] = i - 1
+
+
+def _extract_last_sentence(text: str) -> str:
+    """提取文本最后一个完整句子"""
+    # 按句末标点分割
+    sentences = _SENT_SEPS.split(text.strip())
+    # 过滤空串
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if sentences:
+        return sentences[-1]
+    return ""
+
+
+# ── 段落级分割 ──────────────────────────────────────────
+
+def _split_section_to_units(
+    text: str, char_start: int, has_title: bool
+) -> List[Tuple[str, int, bool]]:
+    """
+    将一个大段按段落 → 句子 逐级分割为语义单元。
+    返回 [(unit_text, unit_char_start, has_title), ...]
+    """
+    units = []
+
+    # 按空行（段落）分割
+    paragraphs = re.split(r'\n\s*\n', text)
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        para_tokens = _approx_tokens(para)
+
+        # 段落够短，直接作为 unit
+        if para_tokens <= 500:  # 段落级上限，留余量给合并
+            units.append((para, char_start, has_title))
+            char_start += len(para) + 2  # +2 for \n\n
+            has_title = False  # 只有第一个 unit 带标题
+            continue
+
+        # 段落太长，按句子分割
+        sentences = _split_by_sentences(para)
+        for sent in sentences:
+            units.append((sent, char_start, has_title))
+            char_start += len(sent)
+            has_title = False
+
+    return units
+
+
+def _split_by_sentences(text: str) -> List[str]:
+    """按句子分割文本，保留句末标点"""
+    parts = _SENT_SEPS.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+# ── 标题分割 ────────────────────────────────────────────
 
 def _split_by_heading(text: str):
     """
     按 ## / ### / --- 等标题标记分割，保留标题行。
     返回 [(section_text, char_start, has_heading)]
     """
-    # 匹配 markdown 标题或数字编号标题
-    pattern = re.compile(r"(^|\n)(#{1,6}\s+|第[一二三四五六七八九十\d]+[章节篇部分]|[A-Z][^。\n]{0,20}\n[-=]{3,})", re.MULTILINE)
+    pattern = re.compile(
+        r"(^|\n)(#{1,6}\s+|第[一二三四五六七八九十\d]+[章节篇部分]|[A-Z][^。\n]{0,20}\n[-=]{3,})",
+        re.MULTILINE,
+    )
     sections = []
     last_end = 0
     last_has_title = False
 
     for m in pattern.finditer(text):
         sec_start = last_end
-        sec_text = text[last_end:m.start()]
+        sec_text = text[last_end : m.start()]
         if sec_text.strip():
             sections.append((sec_text, sec_start, last_has_title))
         last_end = m.start()
         last_has_title = True
 
-    # 剩余部分
     remainder = text[last_end:]
     if remainder.strip():
         sections.append((remainder, last_end, last_has_title))
@@ -136,48 +211,12 @@ def _split_by_heading(text: str):
     return sections
 
 
-def _split_text_by_tokens(text: str, max_tokens: int) -> List[str]:
-    """将文本强制按 token 上限分割成多段，忽略段落边界"""
-    chunks = []
-    while text:
-        # 保留 low water mark 用于 overlap
-        chunk = _take_by_tokens(text, max_tokens)
-        chunks.append(chunk)
-        # 截掉已取部分
-        text = text[len(chunk):]
-    return chunks
-
-
-def _take_by_tokens(text: str, target_tokens: int) -> str:
-    """从文本头部截取约 target_tokens 的字符"""
-    if _approx_tokens(text) <= target_tokens:
-        return text
-    # 按比例估算字符数，保守取 80%
-    ratio = target_tokens / max(_approx_tokens(text), 1)
-    cut = int(len(text) * ratio * 0.8)
-    # 回退到最近的分句处
-    for sep in ("。", "！", "？", "\n", ".", "!", "?"):
-        pos = text.rfind(sep, 0, cut)
-        if pos > cut * 0.5:
-            return text[:pos + 1]
-    return text[:cut]
-
+# ── token 估算 ──────────────────────────────────────────
 
 def _approx_tokens(text: str) -> int:
     """粗略估算 token 数（中英文混合）"""
     if not text:
         return 0
-    # 中文约 1.5 chars/token，英文约 4 chars/token
     chinese_chars = len(re.findall(r'[一-鿿]', text))
     other_chars = len(text) - chinese_chars
     return int(chinese_chars / 1.5 + other_chars / 4)
-
-
-def _tail_by_tokens(text: str, target_tokens: int) -> str:
-    """从末尾保留约 target_tokens 的文本"""
-    if _approx_tokens(text) <= target_tokens:
-        return text
-    # 按比例截取
-    ratio = target_tokens / max(_approx_tokens(text), 1)
-    cut_pos = max(0, int(len(text) * (1 - ratio * 1.2)))
-    return text[cut_pos:]

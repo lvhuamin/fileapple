@@ -18,6 +18,139 @@ const state = {
     isUploading: false
 };
 
+// ========== 上传队列管理器（支持后台上传）==========
+
+const UploadQueueManager = {
+    DB_NAME: 'FileAppleUploadQueue',
+    DB_VERSION: 1,
+    STORE_NAME: 'pendingUploads',
+    
+    db: null,
+    
+    async init() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(this.DB_NAME, this.DB_VERSION);
+            
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+                this.db = request.result;
+                resolve();
+            };
+            
+            request.onupgradeneeded = (event) => {
+                const db = event.target.result;
+                if (!db.objectStoreNames.contains(this.STORE_NAME)) {
+                    const store = db.createObjectStore(this.STORE_NAME, { keyPath: 'id' });
+                    store.createIndex('status', 'status', { unique: false });
+                    store.createIndex('createdAt', 'createdAt', { unique: false });
+                }
+            };
+        });
+    },
+    
+    async addUpload(uploadData) {
+        if (!this.db) await this.init();
+        
+        const record = {
+            id: 'upload_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+            file: uploadData.file,
+            fileName: uploadData.file.name,
+            fileSize: uploadData.file.size,
+            fileType: uploadData.file.type,
+            targetDir: uploadData.targetDir || '',
+            status: 'pending', // pending, uploading, completed, failed
+            progress: 0,
+            taskId: null,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            error: null
+        };
+        
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction([this.STORE_NAME], 'readwrite');
+            const store = transaction.objectStore(this.STORE_NAME);
+            const request = store.add(record);
+            
+            request.onsuccess = () => resolve(record);
+            request.onerror = () => reject(request.error);
+        });
+    },
+    
+    async updateUpload(id, updates) {
+        if (!this.db) await this.init();
+        
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction([this.STORE_NAME], 'readwrite');
+            const store = transaction.objectStore(this.STORE_NAME);
+            const request = store.get(id);
+            
+            request.onsuccess = () => {
+                const record = request.result;
+                if (record) {
+                    Object.assign(record, updates, { updatedAt: new Date().toISOString() });
+                    const updateRequest = store.put(record);
+                    updateRequest.onsuccess = () => resolve(record);
+                    updateRequest.onerror = () => reject(updateRequest.error);
+                } else {
+                    reject(new Error('Record not found'));
+                }
+            };
+            request.onerror = () => reject(request.error);
+        });
+    },
+    
+    async getPendingUploads() {
+        if (!this.db) await this.init();
+        
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction([this.STORE_NAME], 'readonly');
+            const store = transaction.objectStore(this.STORE_NAME);
+            const index = store.index('status');
+            const request = index.getAll('pending');
+            
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    },
+    
+    async getAllUploads() {
+        if (!this.db) await this.init();
+        
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction([this.STORE_NAME], 'readonly');
+            const store = transaction.objectStore(this.STORE_NAME);
+            const request = store.getAll();
+            
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    },
+    
+    async deleteUpload(id) {
+        if (!this.db) await this.init();
+        
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction([this.STORE_NAME], 'readwrite');
+            const store = transaction.objectStore(this.STORE_NAME);
+            const request = store.delete(id);
+            
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    },
+    
+    async clearCompleted() {
+        if (!this.db) await this.init();
+        
+        const uploads = await this.getAllUploads();
+        const completed = uploads.filter(u => u.status === 'completed' || u.status === 'failed');
+        
+        for (const upload of completed) {
+            await this.deleteUpload(upload.id);
+        }
+    }
+};
+
 // ========== 工具函数 ==========
 
 const API_BASE = window.location.origin;
@@ -193,6 +326,178 @@ async function loadFiles() {
         showToast('加载文件失败', 'error');
     } finally {
         showLoading(false);
+    }
+}
+
+// ========== 恋爱专区 ==========
+
+const LOVE_ZONE_DIR = '恋爱专区';
+
+async function loadLoveZoneFiles() {
+    try {
+        const data = await api(`/api/files?path=${encodeURIComponent(LOVE_ZONE_DIR)}&source=uploads&sort_by=time&order=desc`);
+        state.files = data.items || [];
+        renderLoveZone();
+    } catch (e) {
+        state.files = [];
+        renderLoveZone();
+    }
+    updateNavCounts();
+}
+
+function renderLoveZone() {
+    const container = document.getElementById('fileContainer');
+    if (!container) return;
+
+    container.innerHTML = `
+        <div class="love-zone-page">
+            <div class="love-zone-header">
+                <div class="love-zone-title">
+                    <i class="fas fa-heart" style="color: #ff4757;"></i>
+                    <h2>恋爱专区</h2>
+                </div>
+                <p class="love-zone-desc">上传聊天记录、截图、音频、视频或文档，自动转文字后存入恋爱军师知识库</p>
+            </div>
+
+            <div class="love-zone-upload">
+                <div class="love-upload-dropzone" id="loveUploadDropzone">
+                    <i class="fas fa-cloud-upload-alt"></i>
+                    <p>拖拽文件到此处，上传到恋爱专区</p>
+                    <p class="upload-hint">支持 MP3/MP4/PDF/EPUB/JPG/PNG/TXT/MD，上传后自动处理</p>
+                    <button class="btn btn-primary" id="btnLoveUpload">
+                        <i class="fas fa-upload"></i> 选择文件
+                    </button>
+                    <input type="file" id="loveFileInput" multiple hidden>
+                </div>
+                <div class="love-upload-queue" id="loveUploadQueue"></div>
+            </div>
+
+            <div class="love-zone-files">
+                <div class="love-zone-section-title">
+                    <i class="fas fa-folder-open"></i>
+                    <span>已上传文件 (${state.files.length})</span>
+                </div>
+                <div id="loveFileList">
+                    ${state.files.length === 0 ? `
+                        <div class="empty-state" style="padding: 40px;">
+                            <i class="fas fa-heart" style="font-size: 48px; color: var(--gray-300);"></i>
+                            <h3>恋爱专区为空</h3>
+                            <p>上传你的资料，系统会自动处理并存入知识库</p>
+                        </div>
+                    ` : state.files.map(f => `
+                        <div class="love-file-item">
+                            <div class="love-file-icon ${getFileIcon(f.name).class}">
+                                <i class="fas ${getFileIcon(f.name).icon}"></i>
+                            </div>
+                            <div class="love-file-info">
+                                <div class="love-file-name">${f.name}</div>
+                                <div class="love-file-meta">${formatSize(f.size)} · ${formatTime(f.modified)}</div>
+                            </div>
+                            <div class="love-file-status">
+                                <span class="love-status-dot"></span>
+                                ${f.name.endsWith('.md') || f.name.endsWith('.txt') ? '已处理' : '待处理'}
+                            </div>
+                            <button class="icon-btn" onclick="downloadLoveFile('${f.path.replace(/'/g, "\\'")}')" title="下载">
+                                <i class="fas fa-download"></i>
+                            </button>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+        </div>
+    `;
+
+    initLoveUpload();
+}
+
+function downloadLoveFile(path) {
+    window.open(API_BASE + '/api/files/download/' + encodeURIComponent(path) + '?source=uploads', '_blank');
+}
+
+function initLoveUpload() {
+    const dropzone = document.getElementById('loveUploadDropzone');
+    const fileInput = document.getElementById('loveFileInput');
+    const selectBtn = document.getElementById('btnLoveUpload');
+    if (!dropzone) return;
+
+    selectBtn?.addEventListener('click', (e) => { e.stopPropagation(); fileInput?.click(); });
+    dropzone.addEventListener('click', () => fileInput?.click());
+    fileInput?.addEventListener('change', (e) => {
+        if (e.target.files.length) handleLoveFiles(e.target.files);
+    });
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropzone.classList.remove('dragover');
+        if (e.dataTransfer.files.length) handleLoveFiles(e.dataTransfer.files);
+    });
+}
+
+function handleLoveFiles(files) {
+    const queue = document.getElementById('loveUploadQueue');
+    if (!queue) return;
+    queue.innerHTML = '';
+
+    Array.from(files).forEach(file => {
+        const item = document.createElement('div');
+        item.className = 'upload-item';
+        item.innerHTML = `
+            <div class="upload-item-info">
+                <div class="upload-item-name">${file.name}</div>
+                <div class="upload-item-size">${formatSize(file.size)}</div>
+                <div class="upload-item-progress">
+                    <div class="upload-item-fill" style="width: 0%"></div>
+                </div>
+            </div>
+            <button class="icon-btn" onclick="this.parentElement.remove()">
+                <i class="fas fa-times"></i>
+            </button>
+        `;
+        queue.appendChild(item);
+        uploadLoveFile(file, item.querySelector('.upload-item-fill'));
+    });
+}
+
+async function uploadLoveFile(file, progressBar) {
+    const CHUNK_SIZE = 5 * 1024 * 1024;
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+    try {
+        const params = new URLSearchParams({ file_name: file.name, file_size: file.size, target_dir: LOVE_ZONE_DIR });
+        const initRes = await fetch(`${API_BASE}/api/upload/init`, {
+            method: 'POST',
+            body: params
+        });
+        const initData = await initRes.json();
+        if (initData.error) { showToast('上传失败: ' + initData.error, 'error'); return; }
+
+        const taskId = initData.task_id;
+        const uploadedChunks = new Set(initData.uploaded_chunks || []);
+
+        for (let i = 0; i < totalChunks; i++) {
+            if (uploadedChunks.has(i)) continue;
+            const start = i * CHUNK_SIZE;
+            const end = Math.min(start + CHUNK_SIZE, file.size);
+            const chunk = file.slice(start, end);
+            const formData = new FormData();
+            formData.append('task_id', taskId);
+            formData.append('chunk_index', i);
+            formData.append('chunk', chunk);
+            await fetch(`${API_BASE}/api/upload/chunk`, { method: 'POST', body: formData });
+            const percent = ((i + 1) / totalChunks * 100).toFixed(0);
+            if (progressBar) progressBar.style.width = percent + '%';
+        }
+
+        await fetch(`${API_BASE}/api/upload/merge`, {
+            method: 'POST',
+            body: new URLSearchParams({ task_id: taskId })
+        });
+        if (progressBar) progressBar.style.width = '100%';
+        showToast(`${file.name} 上传成功 ✅`);
+        setTimeout(() => loadLoveZoneFiles(), 500);
+    } catch (e) {
+        showToast('上传失败: ' + e.message, 'error');
     }
 }
 
@@ -520,6 +825,9 @@ async function copyShareLink() {
 // ========== 模态框管理 ==========
 
 function openModal(id) {
+    // 关闭详情面板
+    const detailPanel = document.getElementById('detailPanel');
+    if (detailPanel) detailPanel.classList.remove('active');
     document.getElementById(id).classList.add('active');
 }
 
@@ -1188,167 +1496,167 @@ function initTranscribePanel() {
     loadTranscribeHistory();
 }
 
-// ========== RAG 搜索功能 ==========
-
-async function checkRAGHealth() {
-    try {
-        const data = await api('/api/rag/health');
-        return data;
-    } catch (e) {
-        return { status: 'unavailable' };
-    }
-}
-
-async function loadRAGDatasets() {
-    try {
-        const data = await api('/api/rag/datasets');
-        return data.datasets || [];
-    } catch (e) {
-        return [];
-    }
-}
-
-async function searchRAG(query, dataset = 'all') {
-    const container = document.getElementById('ragSearchResults');
-    container.innerHTML = '<div class="loading-state"><div class="spinner"></div><span>搜索中...</span></div>';
-
-    try {
-        const data = await api('/api/rag/search', {
-            method: 'POST',
-            body: JSON.stringify({ query, dataset, top_k: 10 })
-        });
-
-        const results = data.results || [];
-        document.getElementById('ragSearchInfo').textContent = `找到 ${results.length} 条相关结果`;
-
-        if (results.length === 0) {
-            container.innerHTML = `
-                <div class="empty-state">
-                    <i class="fas fa-search"></i>
-                    <p>未找到相关内容</p>
-                </div>
-            `;
-            return;
-        }
-
-        container.innerHTML = results.map((r, i) => `
-            <div class="rag-result-item" data-index="${i}">
-                <div class="rag-result-header">
-                    <span class="rag-result-score">${((r.similarity || 0.8) * 100).toFixed(1)}%</span>
-                    <span class="rag-result-source">${r.source || '未知来源'}</span>
-                </div>
-                <div class="rag-result-content">${highlightText(r.content || r.text || '', query)}</div>
-            </div>
-        `).join('');
-    } catch (e) {
-        container.innerHTML = `
-            <div class="empty-state">
-                <i class="fas fa-exclamation-triangle"></i>
-                <p>搜索失败: ${e.message}</p>
-                <p class="upload-hint">请确保 RAGFlow 服务已启动</p>
-            </div>
-        `;
-    }
-}
-
-function highlightText(text, query) {
-    if (!query) return text;
-    const regex = new RegExp(`(${query})`, 'gi');
-    return text.replace(regex, '<mark>$1</mark>');
-}
-
-// ========== RAG 对话功能 ==========
-
-let ragChatHistory = [];
-
-async function sendRAGChat(question, dataset = 'all') {
-    const messagesContainer = document.getElementById('ragChatMessages');
-
-    // 添加用户消息
-    ragChatHistory.push({ role: 'user', content: question });
-    renderRAGChatMessages();
-
-    // 显示加载
-    const loadingId = 'rag-loading-' + Date.now();
-    messagesContainer.innerHTML += `
-        <div class="rag-message rag-message-assistant" id="${loadingId}">
-            <div class="spinner"></div>
-            <span>思考中...</span>
-        </div>
-    `;
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-
-    try {
-        const data = await api('/api/rag/chat', {
-            method: 'POST',
-            body: JSON.stringify({ question, dataset })
-        });
-
-        // 移除加载状态
-        document.getElementById(loadingId)?.remove();
-
-        const answer = data.answer || data.data?.answer || '抱歉，暂无回答';
-        ragChatHistory.push({ role: 'assistant', content: answer });
-        renderRAGChatMessages();
-    } catch (e) {
-        document.getElementById(loadingId)?.remove();
-        ragChatHistory.push({ role: 'assistant', content: '抱歉，服务暂不可用。' });
-        renderRAGChatMessages();
-    }
-}
-
-function renderRAGChatMessages() {
-    const container = document.getElementById('ragChatMessages');
-    container.innerHTML = ragChatHistory.map(m => `
-        <div class="rag-message rag-message-${m.role}">
-            <div class="rag-message-avatar">
-                ${m.role === 'user' ? '<i class="fas fa-user"></i>' : '<i class="fas fa-robot"></i>'}
-            </div>
-            <div class="rag-message-content">${m.content}</div>
-        </div>
-    `).join('');
-    container.scrollTop = container.scrollHeight;
-}
-
-// ========== RAG 模态框初始化 ==========
-
-function initRAGSearch() {
-    const searchBtn = document.getElementById('btnRagSearch');
-    const searchInput = document.getElementById('ragSearchInput');
-
-    searchBtn?.addEventListener('click', () => {
-        const query = searchInput?.value?.trim();
-        const dataset = document.getElementById('ragSearchDataset')?.value || 'all';
-        if (query) searchRAG(query, dataset);
-    });
-
-    searchInput?.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-            searchBtn?.click();
-        }
-    });
-}
-
-function initRAGChat() {
-    const sendBtn = document.getElementById('btnRagChat');
-    const chatInput = document.getElementById('ragChatInput');
-
-    sendBtn?.addEventListener('click', () => {
-        const question = chatInput?.value?.trim();
-        const dataset = document.getElementById('ragChatDataset')?.value || 'all';
-        if (question) {
-            sendRAGChat(question, dataset);
-            chatInput.value = '';
-        }
-    });
-
-    chatInput?.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            sendBtn?.click();
-        }
-    });
-}
+// ========== RAG 搜索功能 (已禁用，保留代码供未来恢复) ==========
+//
+// async function checkRAGHealth() {
+//     try {
+//         const data = await api('/api/rag/health');
+//         return data;
+//     } catch (e) {
+//         return { status: 'unavailable' };
+//     }
+// }
+//
+// async function loadRAGDatasets() {
+//     try {
+//         const data = await api('/api/rag/datasets');
+//         return data.datasets || [];
+//     } catch (e) {
+//         return [];
+//     }
+// }
+//
+// async function searchRAG(query, dataset = 'all') {
+//     const container = document.getElementById('ragSearchResults');
+//     container.innerHTML = '<div class="loading-state"><div class="spinner"></div><span>搜索中...</span></div>';
+//
+//     try {
+//         const data = await api('/api/rag/search', {
+//             method: 'POST',
+//             body: JSON.stringify({ query, dataset, top_k: 10 })
+//         });
+//
+//         const results = data.results || [];
+//         document.getElementById('ragSearchInfo').textContent = `找到 ${results.length} 条相关结果`;
+//
+//         if (results.length === 0) {
+//             container.innerHTML = `
+//                 <div class="empty-state">
+//                     <i class="fas fa-search"></i>
+//                     <p>未找到相关内容</p>
+//                 </div>
+//             `;
+//             return;
+//         }
+//
+//         container.innerHTML = results.map((r, i) => `
+//             <div class="rag-result-item" data-index="${i}">
+//                 <div class="rag-result-header">
+//                     <span class="rag-result-score">${((r.similarity || 0.8) * 100).toFixed(1)}%</span>
+//                     <span class="rag-result-source">${r.source || '未知来源'}</span>
+//                 </div>
+//                 <div class="rag-result-content">${highlightText(r.content || r.text || '', query)}</div>
+//             </div>
+//         `).join('');
+//     } catch (e) {
+//         container.innerHTML = `
+//             <div class="empty-state">
+//                 <i class="fas fa-exclamation-triangle"></i>
+//                 <p>搜索失败: ${e.message}</p>
+//                 <p class="upload-hint">请确保 RAGFlow 服务已启动</p>
+//             </div>
+//         `;
+//     }
+// }
+//
+// function highlightText(text, query) {
+//     if (!query) return text;
+//     const regex = new RegExp(`(${query})`, 'gi');
+//     return text.replace(regex, '<mark>$1</mark>');
+// }
+//
+// // ========== RAG 对话功能 ==========
+//
+// let ragChatHistory = [];
+//
+// async function sendRAGChat(question, dataset = 'all') {
+//     const messagesContainer = document.getElementById('ragChatMessages');
+//
+//     // 添加用户消息
+//     ragChatHistory.push({ role: 'user', content: question });
+//     renderRAGChatMessages();
+//
+//     // 显示加载
+//     const loadingId = 'rag-loading-' + Date.now();
+//     messagesContainer.innerHTML += `
+//         <div class="rag-message rag-message-assistant" id="${loadingId}">
+//             <div class="spinner"></div>
+//             <span>思考中...</span>
+//         </div>
+//     `;
+//     messagesContainer.scrollTop = messagesContainer.scrollHeight;
+//
+//     try {
+//         const data = await api('/api/rag/chat', {
+//             method: 'POST',
+//             body: JSON.stringify({ question, dataset })
+//         });
+//
+//         // 移除加载状态
+//         document.getElementById(loadingId)?.remove();
+//
+//         const answer = data.answer || data.data?.answer || '抱歉，暂无回答';
+//         ragChatHistory.push({ role: 'assistant', content: answer });
+//         renderRAGChatMessages();
+//     } catch (e) {
+//         document.getElementById(loadingId)?.remove();
+//         ragChatHistory.push({ role: 'assistant', content: '抱歉，服务暂不可用。' });
+//         renderRAGChatMessages();
+//     }
+// }
+//
+// function renderRAGChatMessages() {
+//     const container = document.getElementById('ragChatMessages');
+//     container.innerHTML = ragChatHistory.map(m => `
+//         <div class="rag-message rag-message-${m.role}">
+//             <div class="rag-message-avatar">
+//                 ${m.role === 'user' ? '<i class="fas fa-user"></i>' : '<i class="fas fa-robot"></i>'}
+//             </div>
+//             <div class="rag-message-content">${m.content}</div>
+//         </div>
+//     `).join('');
+//     container.scrollTop = container.scrollHeight;
+// }
+//
+// // ========== RAG 模态框初始化 ==========
+//
+// function initRAGSearch() {
+//     const searchBtn = document.getElementById('btnRagSearch');
+//     const searchInput = document.getElementById('ragSearchInput');
+//
+//     searchBtn?.addEventListener('click', () => {
+//         const query = searchInput?.value?.trim();
+//         const dataset = document.getElementById('ragSearchDataset')?.value || 'all';
+//         if (query) searchRAG(query, dataset);
+//     });
+//
+//     searchInput?.addEventListener('keypress', (e) => {
+//         if (e.key === 'Enter') {
+//             searchBtn?.click();
+//         }
+//     });
+// }
+//
+// function initRAGChat() {
+//     const sendBtn = document.getElementById('btnRagChat');
+//     const chatInput = document.getElementById('ragChatInput');
+//
+//     sendBtn?.addEventListener('click', () => {
+//         const question = chatInput?.value?.trim();
+//         const dataset = document.getElementById('ragChatDataset')?.value || 'all';
+//         if (question) {
+//             sendRAGChat(question, dataset);
+//             chatInput.value = '';
+//         }
+//     });
+//
+//     chatInput?.addEventListener('keypress', (e) => {
+//         if (e.key === 'Enter' && !e.shiftKey) {
+//             e.preventDefault();
+//             sendBtn?.click();
+//         }
+//     });
+// }
 
 // ========== 上传功能 ==========
 
@@ -1530,13 +1838,17 @@ async function switchView(view, category) {
 
     const titles = {
         all: '全部文件',
+        upload: '上传文件',
         uploads: '上传记录',
         downloads: '下载目录',
         category: category || '分类',
         transcribe: '音频转写',
         knowledge: '知识导入',
+        extract: '文本提取',
         cloud: '云盘管理',
-        settings: '设置'
+        logs: '系统日志',
+        settings: '设置',
+        'love-zone': '❤️ 恋爱专区'
     };
 
     document.getElementById('currentPath').innerHTML = `
@@ -1561,19 +1873,32 @@ async function switchView(view, category) {
     state.currentPath = (view === 'category' && category) ? category : '/';
     state.selectedFiles.clear();
 
-    if (view === 'cloud') {
+    if (view === 'upload') {
+        openUploadModal();
+    } else if (view === 'cloud') {
         openCloudModal();
     } else if (view === 'knowledge') {
         openKnowledgeModal();
     } else if (view === 'transcribe') {
         openModal('transcribeModal');
         initTranscribePanel();
-    } else if (view === 'rag-search') {
-        openModal('ragSearchModal');
-        initRAGSearch();
-    } else if (view === 'rag-chat') {
-        openModal('ragChatModal');
-        initRAGChat();
+    // } else if (view === 'rag-search') {
+    //     openModal('ragSearchModal');
+    //     initRAGSearch();
+    // } else if (view === 'rag-chat') {
+    //     openModal('ragChatModal');
+    //     initRAGChat();
+    } else if (view === 'love-zone') {
+        document.querySelectorAll('.modal').forEach(m => m.classList.remove('active'));
+        const backBtn2 = document.getElementById('btnBack');
+        if (backBtn2) backBtn2.style.display = 'none';
+        state.currentSource = 'uploads';
+        state.currentPath = '/';
+        await loadLoveZoneFiles();
+    } else if (view === 'extract') {
+        showExtractModal();
+    } else if (view === 'logs') {
+        showLogsModal();
     } else {
         document.querySelectorAll('.modal').forEach(m => m.classList.remove('active'));
         const backBtn2 = document.getElementById('btnBack');
@@ -1624,12 +1949,18 @@ async function updateNavCounts() {
 
 // ========== 事件绑定 ==========
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+    // 初始化上传队列管理器
+    await UploadQueueManager.init();
+    
     // 初始化上传
     initUpload();
 
     // 加载数据
     loadFiles();
+    
+    // 检查未完成的上传任务
+    await checkPendingUploads();
 
     // 视图切换
     document.querySelectorAll('.view-toggle .icon-btn').forEach(btn => {
@@ -1734,6 +2065,24 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btnImportAll')?.addEventListener('click', importAllFiles);
     document.getElementById('btnScanKnowledge')?.addEventListener('click', loadKnowledgeFiles);
 
+    // 文本提取
+    document.getElementById('btnCloseExtract')?.addEventListener('click', closeExtractModal);
+    document.getElementById('btnSelectExtract')?.addEventListener('click', () => document.getElementById('extractInput')?.click());
+    document.getElementById('btnSelectFolder')?.addEventListener('click', () => document.getElementById('folderInput')?.click());
+    document.getElementById('extractInput')?.addEventListener('change', handleExtractFileSelect);
+    document.getElementById('folderInput')?.addEventListener('change', handleFolderSelect);
+
+    // 文本提取拖拽
+    const extractDropzone = document.getElementById('extractDropzone');
+    if (extractDropzone) {
+        extractDropzone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            extractDropzone.classList.add('dragover');
+        });
+        extractDropzone.addEventListener('dragleave', () => extractDropzone.classList.remove('dragover'));
+        extractDropzone.addEventListener('drop', handleExtractDrop);
+    }
+
     // 分享
     document.getElementById('btnCreateShare')?.addEventListener('click', createShareLink);
     document.getElementById('btnCopyLink')?.addEventListener('click', copyShareLink);
@@ -1756,3 +2105,799 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 });
+
+// ========== 文本提取 ==========
+
+function showExtractModal() {
+    document.getElementById('extractModal')?.classList.add('active');
+    loadExtractStatus();
+}
+
+function closeExtractModal() {
+    document.getElementById('extractModal')?.classList.remove('active');
+}
+
+async function loadExtractStatus() {
+    try {
+        const [statsRes, listRes] = await Promise.all([
+            fetch('/api/extract/status'),
+            fetch('/api/extract/list')
+        ]);
+        
+        if (!statsRes.ok || !listRes.ok) return;
+        
+        const stats = await statsRes.json();
+        const list = await listRes.json();
+        
+        // 更新统计
+        document.getElementById('extractTotal').textContent = stats.total || 0;
+        document.getElementById('extractCompleted').textContent = stats.completed || 0;
+        document.getElementById('extractPending').textContent = stats.pending || 0;
+        document.getElementById('extractError').textContent = stats.error || 0;
+        
+        // 分类显示
+        const pending = list.filter(t => t.status === 'pending' || t.status === 'processing');
+        const history = list.filter(t => t.status === 'completed' || t.status === 'error');
+        
+        document.getElementById('pendingCount').textContent = `(${pending.length})`;
+        document.getElementById('historyCount').textContent = `(${history.length})`;
+        
+        renderExtractPendingList(pending);
+        renderExtractHistoryList(history);
+    } catch (e) {
+        console.error('加载提取状态失败:', e);
+    }
+}
+
+function renderExtractPendingList(tasks) {
+    const container = document.getElementById('extractPendingList');
+    if (!container) return;
+    
+    if (!tasks.length) {
+        container.innerHTML = '<div class="empty-hint">暂无待处理文件</div>';
+        return;
+    }
+    
+    container.innerHTML = tasks.map(task => `
+        <div class="file-item extract-item" data-id="${task.id}">
+            <div class="file-info">
+                <i class="fas fa-${getFileIcon(task.file_ext || task.file_name)}"></i>
+                <span class="file-name">${task.file_name}</span>
+                <span class="file-status status-${task.status}">${getStatusText(task.status)}</span>
+            </div>
+            <div class="file-actions">
+                ${task.status === 'processing' ? '<span class="loading"><i class="fas fa-spinner fa-spin"></i></span>' : ''}
+                ${task.status === 'pending' ? `<button class="btn btn-sm btn-primary" onclick="manualExtract(${task.id})">提取</button>` : ''}
+            </div>
+        </div>
+    `).join('');
+}
+
+function renderExtractHistoryList(tasks) {
+    const container = document.getElementById('extractHistoryList');
+    if (!container) return;
+    
+    if (!tasks.length) {
+        container.innerHTML = '<div class="empty-hint">暂无已处理记录</div>';
+        return;
+    }
+    
+    container.innerHTML = tasks.map(task => `
+        <div class="file-item extract-item ${task.status}" data-id="${task.id}">
+            <div class="file-info">
+                <i class="fas fa-${getFileIcon(task.file_ext || task.file_name)}"></i>
+                <span class="file-name">${task.file_name}</span>
+                <span class="file-status status-${task.status}">${getStatusText(task.status)}</span>
+                <span class="file-chars">${task.char_count ? task.char_count + '字' : ''}</span>
+            </div>
+            <div class="file-actions">
+                ${task.status === 'completed' && task.text_content ? `<button class="btn btn-sm" onclick="viewExtractContent(${task.id})">查看</button>` : ''}
+                ${task.status === 'error' ? `<span class="error-msg">${task.error_message || '失败'}</span>` : ''}
+            </div>
+        </div>
+    `).join('');
+}
+
+async function handleExtractDrop(e) {
+    e.preventDefault();
+    e.target.closest('.upload-dropzone')?.classList.remove('dragover');
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length) await uploadExtractFiles(files);
+}
+
+async function handleExtractFileSelect(e) {
+    const files = Array.from(e.target.files);
+    if (files.length) await uploadExtractFiles(files);
+    e.target.value = '';
+}
+
+async function handleFolderSelect(e) {
+    const files = Array.from(e.target.files);
+    if (files.length) {
+        clientLog('info', '选择文件夹上传', {
+            fileCount: files.length,
+            firstFile: files[0]?.webkitRelativePath || files[0]?.name
+        });
+        await uploadExtractFiles(files);
+    }
+    e.target.value = '';
+}
+
+async function uploadExtractFiles(files) {
+    const targetDir = document.getElementById('extractTargetDir')?.value || '';
+    const LARGE_SIZE = 5 * 1024 * 1024; // 5MB以上用断点上传
+
+    for (const file of files) {
+        if (file.size > LARGE_SIZE) {
+            await chunkedExtractUpload(file, targetDir);
+        } else {
+            await simpleExtractUpload([file], targetDir);
+        }
+    }
+    loadExtractStatus();
+}
+
+async function simpleExtractUpload(files, targetDir) {
+    const fileNames = files.map(f => f.name).join(', ');
+    const fileSizes = files.map(f => `${f.name}(${(f.size / 1024).toFixed(2)}KB)`).join(', ');
+    
+    clientLog('info', '开始上传文件', {
+        files: fileNames,
+        sizes: fileSizes,
+        targetDir: targetDir || '根目录',
+        totalFiles: files.length
+    });
+
+    // 将文件添加到上传队列
+    for (const file of files) {
+        await UploadQueueManager.addUpload({
+            file: file,
+            targetDir: targetDir
+        });
+    }
+
+    // 显示进度条
+    showUploadProgress(fileNames, '已加入上传队列');
+
+    // 开始处理队列
+    await processUploadQueue();
+}
+
+async function processUploadQueue() {
+    const pendingUploads = await UploadQueueManager.getPendingUploads();
+    
+    if (pendingUploads.length === 0) {
+        hideUploadProgress();
+        return;
+    }
+
+    for (const upload of pendingUploads) {
+        if (upload.file instanceof File) {
+            // 继续上传
+            await uploadSingleFile(upload);
+        } else {
+            // File对象丢失（页面刷新），需要重新选择文件
+            await UploadQueueManager.updateUpload(upload.id, {
+                status: 'failed',
+                error: 'File对象丢失，请重新选择文件'
+            });
+        }
+    }
+
+    // 清理已完成的任务
+    await UploadQueueManager.clearCompleted();
+    
+    // 更新队列徽章
+    updateQueueBadge();
+    
+    // 刷新状态
+    loadExtractStatus();
+}
+
+async function uploadSingleFile(upload) {
+    const formData = new FormData();
+    formData.append('file', upload.file);
+    if (upload.targetDir) formData.append('target_dir', upload.targetDir);
+
+    await UploadQueueManager.updateUpload(upload.id, { status: 'uploading' });
+    showUploadProgress(upload.fileName, '上传中...');
+
+    try {
+        const startTime = Date.now();
+        
+        // 使用XMLHttpRequest以获取上传进度
+        const xhr = new XMLHttpRequest();
+        const uploadPromise = new Promise((resolve, reject) => {
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    const speed = e.loaded / ((Date.now() - startTime) / 1000);
+                    const timeLeft = (e.total - e.loaded) / speed;
+                    updateUploadProgress(percent, `上传中 ${percent}%`, null, formatSpeed(speed), formatTime(timeLeft));
+                    UploadQueueManager.updateUpload(upload.id, { progress: percent });
+                }
+            };
+            
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    resolve(JSON.parse(xhr.responseText));
+                } else {
+                    reject(new Error('上传失败: ' + xhr.status));
+                }
+            };
+            
+            xhr.onerror = () => reject(new Error('网络错误'));
+            
+            xhr.open('POST', '/api/extract/upload');
+            xhr.send(formData);
+        });
+        
+        const data = await uploadPromise;
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+        
+        await UploadQueueManager.updateUpload(upload.id, {
+            status: 'completed',
+            taskId: data.task_id,
+            progress: 100
+        });
+        
+        clientLog('info', '文件上传成功', {
+            fileName: upload.fileName,
+            taskId: data.task_id,
+            fileType: data.file_type,
+            charCount: data.char_count,
+            elapsed: elapsed + 's'
+        });
+        
+        showUploadProgress(upload.fileName, '上传完成', 'success');
+        showToast(`${upload.fileName} 上传成功`, 'success');
+        
+        // 触发文本提取
+        if (data.file_path) {
+            await triggerExtractByPath(data.file_path, upload.fileName, upload.targetDir);
+        }
+    } catch (e) {
+        await UploadQueueManager.updateUpload(upload.id, {
+            status: 'failed',
+            error: e.message
+        });
+        
+        clientLog('error', '文件上传异常', {
+            fileName: upload.fileName,
+            error: e.message,
+            stack: e.stack
+        });
+        showUploadProgress(upload.fileName, '上传失败: ' + e.message, 'error');
+        showToast('上传失败: ' + e.message, 'error');
+    }
+}
+
+async function chunkedExtractUpload(file, targetDir) {
+    const CHUNK_SIZE = 5 * 1024 * 1024;
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+    // 将文件添加到上传队列
+    const upload = await UploadQueueManager.addUpload({
+        file: file,
+        targetDir: targetDir
+    });
+
+    clientLog('info', '开始分片上传', {
+        fileName: file.name,
+        fileSize: (file.size / 1024 / 1024).toFixed(2) + 'MB',
+        totalChunks: totalChunks,
+        uploadId: upload.id,
+        targetDir: targetDir || '根目录'
+    });
+
+    // 显示进度条
+    showUploadProgress(file.name, `准备上传 (${totalChunks}分片)...`);
+
+    try {
+        // 1. 初始化
+        const startTime = Date.now();
+        const initFormData = new FormData();
+        initFormData.append('file_name', file.name);
+        initFormData.append('file_size', file.size);
+        if (targetDir) initFormData.append('target_dir', targetDir);
+        
+        const initRes = await fetch('/api/upload/init', {
+            method: 'POST',
+            body: initFormData
+        });
+        
+        if (!initRes.ok) {
+            const errorText = await initRes.text();
+            clientLog('error', '分片上传初始化失败', {
+                uploadId: upload.id,
+                status: initRes.status,
+                error: errorText
+            });
+            throw new Error('初始化失败: ' + errorText);
+        }
+        
+        const initData = await initRes.json();
+        await UploadQueueManager.updateUpload(upload.id, { 
+            status: 'uploading',
+            taskId: initData.task_id 
+        });
+        
+        clientLog('info', '分片上传初始化成功', { uploadId: upload.id, taskId: initData.task_id });
+        updateUploadProgress(0, '初始化完成');
+
+        // 2. 分片上传
+        let uploadedSize = 0;
+        for (let i = 0; i < totalChunks; i++) {
+            const start = i * CHUNK_SIZE;
+            const chunk = file.slice(start, start + CHUNK_SIZE);
+            const formData = new FormData();
+            formData.append('task_id', initData.task_id);
+            formData.append('chunk_index', i);
+            formData.append('chunk', chunk);
+
+            const chunkStartTime = Date.now();
+            const chunkRes = await fetch('/api/upload/chunk', { method: 'POST', body: formData });
+            const chunkElapsed = ((Date.now() - chunkStartTime) / 1000).toFixed(2);
+            
+            if (!chunkRes.ok) {
+                const errorText = await chunkRes.text();
+                clientLog('error', '分片上传失败', {
+                    uploadId: upload.id,
+                    chunkIndex: i,
+                    status: chunkRes.status,
+                    error: errorText
+                });
+                throw new Error(`分片${i+1}失败: ${errorText}`);
+            }
+            
+            uploadedSize += chunk.size;
+            const progress = Math.round((i + 1) / totalChunks * 100);
+            const speed = uploadedSize / ((Date.now() - startTime) / 1000);
+            const timeLeft = (file.size - uploadedSize) / speed;
+            
+            updateUploadProgress(progress, `上传分片 ${i+1}/${totalChunks}`, null, formatSpeed(speed), formatTime(timeLeft));
+            await UploadQueueManager.updateUpload(upload.id, { progress: progress });
+            
+            clientLog('info', '分片上传进度', {
+                uploadId: upload.id,
+                chunkIndex: i,
+                progress: progress + '%',
+                chunkTime: chunkElapsed + 's'
+            });
+        }
+
+        // 3. 合并
+        updateUploadProgress(100, '合并文件中...');
+        const mergeStartTime = Date.now();
+        const mergeFormData = new FormData();
+        mergeFormData.append('task_id', initData.task_id);
+        
+        const mergeRes = await fetch('/api/upload/merge', {
+            method: 'POST',
+            body: mergeFormData
+        });
+
+        const mergeElapsed = ((Date.now() - mergeStartTime) / 1000).toFixed(2);
+
+        if (mergeRes.ok) {
+            const data = await mergeRes.json();
+            const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+            
+            await UploadQueueManager.updateUpload(upload.id, {
+                status: 'completed',
+                progress: 100
+            });
+            
+            clientLog('info', '分片上传完成', {
+                uploadId: upload.id,
+                fileName: file.name,
+                filePath: data.file_path,
+                mergeTime: mergeElapsed + 's',
+                totalTime: totalElapsed + 's'
+            });
+            
+            showUploadProgress(file.name, '上传完成', 'success');
+            showToast(`上传完成: ${file.name}`, 'success');
+            
+            // 4. 触发提取
+            if (data.file_path) {
+                await triggerExtractByPath(data.file_path, file.name, targetDir);
+            }
+        } else {
+            const errorText = await mergeRes.text();
+            clientLog('error', '分片合并失败', {
+                uploadId: upload.id,
+                status: mergeRes.status,
+                error: errorText
+            });
+            throw new Error('合并失败: ' + errorText);
+        }
+    } catch (e) {
+        await UploadQueueManager.updateUpload(upload.id, {
+            status: 'failed',
+            error: e.message
+        });
+        
+        clientLog('error', '分片上传异常', {
+            uploadId: upload.id,
+            fileName: file.name,
+            error: e.message,
+            stack: e.stack
+        });
+        showUploadProgress(file.name, '上传失败: ' + e.message, 'error');
+        showToast('上传失败: ' + e.message, 'error');
+    }
+}
+
+async function checkPendingUploads() {
+    try {
+        const pending = await UploadQueueManager.getPendingUploads();
+        if (pending.length > 0) {
+            console.log(`发现 ${pending.length} 个未完成的上传任务`);
+            showToast(`发现 ${pending.length} 个未完成的上传任务`, 'info');
+            
+            // 显示待恢复的上传列表
+            const fileList = pending.map(u => `• ${u.fileName} (${u.progress || 0}%)`).join('\n');
+            if (confirm(`以下上传任务未完成，是否继续？\n\n${fileList}\n\n点击"确定"继续上传`)) {
+                processUploadQueue();
+            }
+        }
+    } catch (e) {
+        console.error('检查未完成上传失败:', e);
+    }
+}
+
+function updateQueueBadge() {
+    const badge = document.getElementById('uploadQueueBadge');
+    if (!badge) return;
+    
+    const pending = UploadQueueManager.uploads.filter(u => u.status === 'pending' || u.status === 'uploading');
+    if (pending.length > 0) {
+        badge.textContent = pending.length;
+        badge.style.display = 'flex';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+async function triggerExtractByPath(filePath, fileName, targetDir) {
+    clientLog('info', '触发文本提取', {
+        filePath: filePath,
+        fileName: fileName,
+        targetDir: targetDir || '根目录'
+    });
+    
+    try {
+        const startTime = Date.now();
+        const res = await fetch('/api/extract/process', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                file_path: filePath,
+                file_name: fileName,
+                target_dir: targetDir
+            })
+        });
+        
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+        
+        if (res.ok) {
+            const data = await res.json();
+            clientLog('info', '文本提取触发成功', {
+                fileName: fileName,
+                taskId: data.task_id,
+                elapsed: elapsed + 's'
+            });
+            showToast('已开始提取...', 'info');
+        } else {
+            const errorData = await res.json().catch(() => ({}));
+            clientLog('error', '文本提取触发失败', {
+                fileName: fileName,
+                status: res.status,
+                error: errorData.detail || '未知错误'
+            });
+            showToast('提取失败', 'error');
+        }
+    } catch (e) {
+        clientLog('error', '文本提取触发异常', {
+            fileName: fileName,
+            error: e.message,
+            stack: e.stack
+        });
+        console.error('触发提取失败:', e);
+    }
+}
+
+async function manualExtract(id) {
+    clientLog('info', '手动触发提取', { taskId: id });
+    
+    try {
+        const startTime = Date.now();
+        const res = await fetch(`/api/extract/process/${id}`, { method: 'POST' });
+        const data = await res.json();
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+        
+        if (res.ok) {
+            clientLog('info', '手动提取触发成功', {
+                taskId: id,
+                elapsed: elapsed + 's'
+            });
+            showToast('已开始提取', 'success');
+            // 轮询状态
+            pollExtractStatus(id);
+        } else {
+            clientLog('error', '手动提取触发失败', {
+                taskId: id,
+                status: res.status,
+                error: data.detail || '未知错误'
+            });
+            showToast(data.detail || '提取失败', 'error');
+        }
+    } catch (e) {
+        clientLog('error', '手动提取触发异常', {
+            taskId: id,
+            error: e.message,
+            stack: e.stack
+        });
+        showToast('提取失败: ' + e.message, 'error');
+    }
+}
+
+async function pollExtractStatus(id) {
+    const maxAttempts = 60;
+    let attempts = 0;
+    
+    const poll = async () => {
+        if (attempts++ >= maxAttempts) return;
+        
+        try {
+            const res = await fetch('/api/extract/list');
+            const list = await res.json();
+            const task = list.find(t => t.id === id);
+            
+            if (task) {
+                if (task.status === 'completed') {
+                    showToast('提取完成', 'success');
+                    loadExtractStatus();
+                } else if (task.status === 'error') {
+                    showToast('提取失败: ' + (task.error_message || '未知错误'), 'error');
+                    loadExtractStatus();
+                } else {
+                    setTimeout(poll, 2000);
+                }
+            }
+        } catch (e) {
+            setTimeout(poll, 5000);
+        }
+    };
+    
+    poll();
+}
+
+async function viewExtractContent(id) {
+    try {
+        const res = await fetch('/api/extract/list');
+        const list = await res.json();
+        const task = list.find(t => t.id === id);
+        
+        if (task && task.text_content) {
+            showTextPreview(task.file_name, task.text_content);
+        }
+    } catch (e) {
+        showToast('加载失败', 'error');
+    }
+}
+
+function showTextPreview(title, content) {
+    const modal = document.createElement('div');
+    modal.className = 'modal active';
+    modal.innerHTML = `
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3><i class="fas fa-file-alt"></i> ${title}</h3>
+                <button class="icon-btn" onclick="this.closest('.modal').remove()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <pre class="text-preview">${escapeHtml(content)}</pre>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function getStatusText(status) {
+    const map = { pending: '待处理', processing: '处理中', completed: '已完成', error: '失败' };
+    return map[status] || status;
+}
+
+// ========== 系统日志 ==========
+
+let logsAutoRefreshInterval = null;
+
+function showLogsModal() {
+    document.getElementById('logsModal')?.classList.add('active');
+    loadLogs();
+    initLogsEvents();
+}
+
+function closeLogsModal() {
+    document.getElementById('logsModal')?.classList.remove('active');
+    stopLogsAutoRefresh();
+}
+
+function initLogsEvents() {
+    document.getElementById('btnCloseLogs')?.addEventListener('click', closeLogsModal);
+    document.getElementById('btnRefreshLogs')?.addEventListener('click', loadLogs);
+    document.getElementById('btnAutoRefresh')?.addEventListener('click', toggleLogsAutoRefresh);
+    document.getElementById('btnClearLogs')?.addEventListener('click', clearLogsDisplay);
+    document.getElementById('logsLevelFilter')?.addEventListener('change', loadLogs);
+    document.getElementById('logsLimit')?.addEventListener('change', loadLogs);
+}
+
+async function loadLogs() {
+    const container = document.getElementById('logsContainer');
+    if (!container) return;
+    
+    const level = document.getElementById('logsLevelFilter')?.value || '';
+    const limit = document.getElementById('logsLimit')?.value || 100;
+    
+    clientLog('info', '加载系统日志', { level: level || '全部', limit: limit });
+    
+    try {
+        const res = await fetch(`/api/client/logs?limit=${limit}&level=${level}`);
+        const data = await res.json();
+        
+        if (data.logs && data.logs.length > 0) {
+            renderLogs(data.logs);
+            document.getElementById('logsCount').textContent = `共 ${data.total} 条日志`;
+            document.getElementById('logsLastUpdate').textContent = `最后更新: ${new Date().toLocaleTimeString()}`;
+        } else {
+            container.innerHTML = `
+                <div class="empty-state">
+                    <i class="fas fa-list-alt"></i>
+                    <p>暂无日志记录</p>
+                </div>
+            `;
+        }
+    } catch (e) {
+        clientLog('error', '加载日志失败', { error: e.message });
+        container.innerHTML = `
+            <div class="empty-state">
+                <i class="fas fa-exclamation-triangle"></i>
+                <p>加载日志失败: ${e.message}</p>
+            </div>
+        `;
+    }
+}
+
+function renderLogs(logs) {
+    const container = document.getElementById('logsContainer');
+    if (!container) return;
+    
+    container.innerHTML = logs.map(log => {
+        const levelClass = log.level || 'info';
+        const timestamp = log.timestamp || '';
+        const message = escapeHtml(log.message || log.raw || '');
+        
+        return `
+            <div class="log-entry ${levelClass}">
+                <span class="log-timestamp">${timestamp}</span>
+                <span class="log-level ${levelClass}">${levelClass}</span>
+                <span class="log-message">${message}</span>
+            </div>
+        `;
+    }).join('');
+    
+    // 滚动到底部
+    container.scrollTop = container.scrollHeight;
+}
+
+function toggleLogsAutoRefresh() {
+    const btn = document.getElementById('btnAutoRefresh');
+    if (logsAutoRefreshInterval) {
+        stopLogsAutoRefresh();
+        btn.innerHTML = '<i class="fas fa-play"></i> 自动刷新';
+        btn.classList.remove('active');
+    } else {
+        logsAutoRefreshInterval = setInterval(loadLogs, 3000);
+        btn.innerHTML = '<i class="fas fa-pause"></i> 停止刷新';
+        btn.classList.add('active');
+        clientLog('info', '开启日志自动刷新');
+    }
+}
+
+function stopLogsAutoRefresh() {
+    if (logsAutoRefreshInterval) {
+        clearInterval(logsAutoRefreshInterval);
+        logsAutoRefreshInterval = null;
+    }
+}
+
+function clearLogsDisplay() {
+    const container = document.getElementById('logsContainer');
+    if (container) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <i class="fas fa-list-alt"></i>
+                <p>日志已清空</p>
+            </div>
+        `;
+    }
+    document.getElementById('logsCount').textContent = '共 0 条日志';
+    document.getElementById('logsLastUpdate').textContent = `最后更新: ${new Date().toLocaleTimeString()}`;
+}
+
+// ========== 上传进度条 ==========
+
+function showUploadProgress(fileName, status, type = 'info') {
+    const progressEl = document.getElementById('uploadProgress');
+    const fileNameEl = document.getElementById('uploadFileName');
+    const statusEl = document.getElementById('uploadStatus');
+    const fillEl = document.getElementById('uploadFill');
+    const percentEl = document.getElementById('uploadPercent');
+    
+    if (!progressEl) return;
+    
+    progressEl.style.display = 'block';
+    progressEl.className = 'upload-progress ' + (type || '');
+    fileNameEl.textContent = fileName;
+    statusEl.textContent = status;
+    fillEl.style.width = '0%';
+    percentEl.textContent = '0%';
+}
+
+function updateUploadProgress(percent, status, type = null, speed = null, timeLeft = null) {
+    const progressEl = document.getElementById('uploadProgress');
+    const statusEl = document.getElementById('uploadStatus');
+    const fillEl = document.getElementById('uploadFill');
+    const percentEl = document.getElementById('uploadPercent');
+    const speedEl = document.getElementById('uploadSpeed');
+    const timeLeftEl = document.getElementById('uploadTimeLeft');
+    
+    if (!progressEl) return;
+    
+    if (type) progressEl.className = 'upload-progress ' + type;
+    if (status) statusEl.textContent = status;
+    
+    fillEl.style.width = percent + '%';
+    percentEl.textContent = percent + '%';
+    
+    if (speedEl && speed) speedEl.textContent = speed;
+    if (timeLeftEl && timeLeft) timeLeftEl.textContent = timeLeft;
+}
+
+function hideUploadProgress() {
+    const progressEl = document.getElementById('uploadProgress');
+    if (progressEl) {
+        progressEl.style.display = 'none';
+    }
+}
+
+function formatSpeed(bytesPerSecond) {
+    if (bytesPerSecond < 1024) {
+        return bytesPerSecond.toFixed(1) + ' B/s';
+    } else if (bytesPerSecond < 1024 * 1024) {
+        return (bytesPerSecond / 1024).toFixed(1) + ' KB/s';
+    } else {
+        return (bytesPerSecond / (1024 * 1024)).toFixed(1) + ' MB/s';
+    }
+}
+
+function formatTime(seconds) {
+    if (!seconds || seconds < 0) return '-';
+    if (seconds < 60) {
+        return Math.round(seconds) + '秒';
+    } else if (seconds < 3600) {
+        return Math.round(seconds / 60) + '分钟';
+    } else {
+        return (seconds / 3600).toFixed(1) + '小时';
+    }
+}
